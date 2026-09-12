@@ -93,6 +93,16 @@ Edits to `SKILL.md` take effect in the next session. Before committing:
 claude plugin validate ./plugins/opencode-delegate --strict
 ```
 
+To ship a change to people installed from GitHub, bump `version` in both
+`plugins/opencode-delegate/.claude-plugin/plugin.json` and
+`.claude-plugin/marketplace.json` — `claude plugin update` only refetches when
+the version changes. Users then run:
+
+```
+claude plugin marketplace update opencode-delegate
+claude plugin update opencode-delegate
+```
+
 ## When it fires
 
 `/delegate` is user-invoked only (`disable-model-invocation: true` in the
