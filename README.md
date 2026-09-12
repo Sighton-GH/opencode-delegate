@@ -228,7 +228,9 @@ What a dispatch does, in order:
 
 1. Validates the spec: exists, non-empty, has `# Objective`, `# Files`,
    `# Tasks`, `# Verification`, `# Definition of done`, `# Required output`.
-2. Adds `.oc-worktrees/` and `.oc-runs/` to `.gitignore` if absent.
+2. Adds `.oc-worktrees/` and `.oc-runs/` to `.gitignore` if absent. This
+   edit is left uncommitted; commit it whenever convenient. It is the one
+   change `--merge` and `oc-undo` tolerate in an otherwise clean tree.
 3. Creates `.oc-worktrees/NAME` on new branch `NAME` off current HEAD
    (default name `oc/SPEC-BASENAME-HHMMSS`). An existing worktree is reused
    only with `--session ID` (resume that session) or `--session new --branch
@@ -279,8 +281,8 @@ oc-undo --list   show recent oc-task merges (and whether each was reverted)
 
 Finds the newest merge commit carrying the `oc-task-run:` trailer and runs
 `git revert -m 1` on it, printing the run id, spec path, and model so it's
-obvious what was undone. Refuses on a dirty tree and on a merge that was
-already reverted.
+obvious what was undone. Refuses on a dirty tree (with the same `.gitignore`
+exemption as `--merge`) and on a merge that was already reverted.
 
 ## Troubleshooting
 

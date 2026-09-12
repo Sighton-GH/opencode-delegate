@@ -47,7 +47,9 @@ branch=$(sed -n 's/^branch: //p' <<<"$full_body" | head -1)
 if git log --format=%B "$sha..HEAD" | grep -q "This reverts commit $sha"; then
   die "merge $(git rev-parse --short "$sha") (run $run_id) was already reverted"
 fi
-[[ -z "$(git status --porcelain --untracked-files=no)" ]] || die "working tree is dirty; commit or stash first"
+# Same exemption as oc-task --merge: the .gitignore line oc-task adds is allowed to be uncommitted.
+dirty=$(git status --porcelain --untracked-files=no | grep -vE '^.. \.gitignore$' || true)
+[[ -z "$dirty" ]] || die "working tree is dirty; commit or stash first:"$'\n'"$dirty"
 
 git revert --no-edit -m 1 "$sha" >/dev/null 2>&1 \
   || { git revert --abort >/dev/null 2>&1 || true; die "revert of $(git rev-parse --short "$sha") hit conflicts; aborted"; }
