@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# oc-task — dispatch a written spec to an opencode model inside a git worktree,
+# capture everything, and print only a compact summary.
+#
+#   oc-task --spec <path> [--model <provider/model>] [--branch <name>]
+#           [--session <id>|new] [--dry-run]
+#   oc-task --merge (--branch <name> | --session <id>) --verified "<command>"
+#
+# Model precedence: --model > $OC_DELEGATE_MODEL > config `model=` > built-in.
+# Config: ${XDG_CONFIG_HOME:-~/.config}/oc-delegate/config (created on first run).
+#
+# Exit codes
+#   0  success, changes produced
+#   1  opencode errored (generic) / setup failure
+#   2  spec rejected — missing or malformed
+#   3  completed but zero changes
+#   4  session poisoned by image limit — unrecoverable
+#   5  rate limited by the provider
+set -euo pipefail
+
+# Built-in default. Resolved from the live catalog (`opencode models --verbose`,
+# cost 0/0, name "Muse Spark 1.3 Free") on 2026-09-12. Override rather than edit.
+DEFAULT_MODEL="opencode/muse-spark-1.3-contributor-free"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/oc-delegate"
+CONFIG_FILE="$CONFIG_DIR/config"
+REQUIRED_SECTIONS=("Objective" "Files" "Tasks" "Verification" "Definition of done" "Required output")
+WORKTREES_DIR=".oc-worktrees"
+RUNS_DIR=".oc-runs"
+MERGE_MARKER="oc-task-run:"
+
+# Error classification. The image-limit phrase is opencode's own (issues #48647,
+# #39677); it is not a context overflow, so opencode never auto-recovers from it.
+IMAGE_LIMIT_RE='exceeding the maximum of[^"]*images'
+RATE_LIMIT_RE='rate[ _-]?limit|too many requests|status(code)?[^0-9]*429|"429"|quota (exceeded|reached)|overloaded|capacity'
+
+EX_OK=0; EX_ERR=1; EX_SPEC=2; EX_NOCHANGE=3; EX_IMAGES=4; EX_RATE=5
+
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+die()   { local code=$1; shift; echo "oc-task: $*" >&2; exit "$code"; }
+
+# ---------------------------------------------------------------- arguments
+spec=""; model_arg=""; branch=""; session=""; do_merge=0; dry_run=0; verified=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --spec)     spec="${2:-}"; shift 2 ;;
+    --model)    model_arg="${2:-}"; shift 2 ;;
+    --branch)   branch="${2:-}"; shift 2 ;;
+    --session)  session="${2:-}"; shift 2 ;;
+    --verified) verified="${2:-}"; shift 2 ;;
+    --merge)    do_merge=1; shift ;;
+    --dry-run)  dry_run=1; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    *) usage >&2; die "$EX_ERR" "unknown argument: $1" ;;
+  esac
+done
+
+for dep in git opencode jq curl; do
+  command -v "$dep" >/dev/null 2>&1 || die "$EX_ERR" "missing dependency: $dep"
+done
+
+# ---------------------------------------------------------------- config / model
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<EOF
+# oc-delegate config. Lines are key=value. Created by oc-task on $(date -u +%Y-%m-%d).
+# Default model when neither --model nor \$OC_DELEGATE_MODEL is set.
+# Run \`oc-models --free\` for the live list.
+#model=$DEFAULT_MODEL
+EOF
+fi
+config_model=$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*//p' "$CONFIG_FILE" | tail -1 | tr -d '[:space:]')
+if   [[ -n "$model_arg" ]];                   then model="$model_arg";              model_src="--model"
+elif [[ -n "${OC_DELEGATE_MODEL:-}" ]];       then model="$OC_DELEGATE_MODEL";      model_src="\$OC_DELEGATE_MODEL"
+elif [[ -n "$config_model" ]];                then model="$config_model";           model_src="$CONFIG_FILE"
+else                                               model="$DEFAULT_MODEL";          model_src="built-in default"
+fi
+[[ "$model" == */* ]] || die "$EX_ERR" "model must be provider/model, got: $model"
+provider_id="${model%%/*}"; model_id="${model#*/}"
+
+# ---------------------------------------------------------------- repo
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || die "$EX_ERR" "not inside a git repository"
+cd "$repo_root"
+runs_dir="$repo_root/$RUNS_DIR"
+wt_root="$repo_root/$WORKTREES_DIR"
+
+# Latest run record matching a jq filter, or empty.
+find_run() { # $1 = jq select expression
+  ls "$runs_dir"/*.json 2>/dev/null | sort | while read -r f; do
+    jq -e "select($1) | .run_id" "$f" >/dev/null 2>&1 && echo "$f"
+  done | tail -1
+  return 0
+}
+
+fmt_duration() { local s=$1; printf '%dm%02ds' $((s/60)) $((s%60)); }
+
+# Extract the paths a spec's `# Files` section names. Any token containing `/`
+# or `.`, with quoting/punctuation stripped. Directories end in `/`; globs pass
+# through so `[[ path == token ]]` can match them.
+spec_file_tokens() {
+  awk 'tolower($0) ~ /^#+[[:space:]]*files[[:space:]]*$/ {f=1; next} /^#+[[:space:]]/ {f=0} f' "$1" \
+    | grep -oE '[A-Za-z0-9_@./*?~-]+' | grep -E '[/.]' | sed -E 's/^[.]+$//; s/[.,;:]+$//' | grep -v '^$' | sort -u
+}
+
+# ---------------------------------------------------------------- spec checks
+check_spec() { # prints missing sections, one per line; returns 0 if none
+  local missing=0 s
+  [[ -n "$spec" ]]       || { echo "no --spec given"; return 1; }
+  [[ -f "$spec" ]]       || { echo "spec not found: $spec"; return 1; }
+  [[ -s "$spec" ]]       || { echo "spec is empty: $spec"; return 1; }
+  for s in "${REQUIRED_SECTIONS[@]}"; do
+    if ! grep -qiE "^#+[[:space:]]*${s}[[:space:]]*$" "$spec"; then
+      echo "missing section: # $s"; missing=1
+    fi
+  done
+  return $missing
+}
+
+# ================================================================ MERGE MODE
+if [[ $do_merge -eq 1 ]]; then
+  refuse() { echo "oc-task: merge refused — $*" >&2; exit "$EX_ERR"; }
+  [[ -n "$branch" || -n "$session" ]] || refuse "pass --branch <name> or --session <id> to pick the run"
+  if [[ -n "$session" ]]; then rec=$(find_run ".session_id == \"$session\"")
+  else                         rec=$(find_run ".branch == \"$branch\""); fi
+  [[ -n "$rec" ]] || refuse "no run record found in $RUNS_DIR for that branch/session"
+  branch=$(jq -r .branch "$rec"); base=$(jq -r .base_branch "$rec")
+  run_id=$(jq -r .run_id "$rec"); rmodel=$(jq -r .model "$rec"); rspec=$(jq -r .spec "$rec")
+  rsession=$(jq -r .session_id "$rec"); rexit=$(jq -r .exit_code "$rec"); rresult=$(jq -r .result "$rec")
+
+  # 1. on the base branch, clean tree. The one exemption is .gitignore, which
+  #    oc-task itself edits at dispatch time.
+  cur=$(git symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)
+  [[ "$cur" == "$base" ]] || refuse "currently on '$cur', but the worktree forked from '$base' — check it out first"
+  dirty=$(git status --porcelain --untracked-files=no | grep -vE '^.. \.gitignore$' || true)
+  [[ -z "$dirty" ]] || refuse "working tree is dirty:"$'\n'"$dirty"
+  # 2. the run exited 0
+  [[ "$rexit" == "0" ]] || refuse "run $run_id exited $rexit, not 0"
+  # 3. a parseable RESULT block
+  grep -q '^## RESULT' <<<"$rresult" && grep -qi '^Files changed:' <<<"$rresult" \
+    || refuse "run $run_id has no parseable '## RESULT' block (needs a 'Files changed:' line)"
+  # 4. the caller re-ran verification. oc-task never trusts the model's own claim.
+  [[ -n "$verified" ]] || refuse "pass --verified \"<command>\" — the verification command you re-ran yourself in the worktree and saw pass"
+  # 5. every changed file is named in a spec's Files section. Correction specs
+  #    list only what they fix, so take the union over every run on this branch.
+  git show-ref --verify --quiet "refs/heads/$branch" || refuse "branch '$branch' no longer exists"
+  mapfile -t tokens < <(
+    for f in "$runs_dir"/*.json; do jq -r "select(.branch == \"$branch\") | .spec" "$f"; done 2>/dev/null \
+      | sort -u | while read -r sp; do [[ -f "$sp" ]] && spec_file_tokens "$sp"; done | sort -u)
+  [[ ${#tokens[@]} -gt 0 ]] || refuse "no spec for branch '$branch' names any path in its # Files section (looked at $rspec)"
+  outside=()
+  while IFS= read -r p; do
+    ok=0
+    for t in "${tokens[@]}"; do
+      # shellcheck disable=SC2053
+      if [[ "$p" == $t ]] || { [[ "$t" == */ ]] && [[ "$p" == "$t"* ]]; }; then ok=1; break; fi
+    done
+    [[ $ok -eq 1 ]] || outside+=("$p")
+  done < <(git diff --name-only "$base...$branch")
+  [[ ${#outside[@]} -eq 0 ]] || refuse "diff touches files not listed in the spec's # Files section:"$'\n'"$(printf '  %s\n' "${outside[@]}")"
+  git diff --quiet "$base...$branch" && refuse "branch '$branch' has no changes relative to '$base'"
+  # 6. no conflicts. --no-ff so there is exactly one commit to revert.
+  msg=$(printf 'oc-task merge: %s\n\n%s %s\nmodel: %s\nspec: %s\nbranch: %s\nsession: %s\nverified: %s\n' \
+        "$branch" "$MERGE_MARKER" "$run_id" "$rmodel" "$rspec" "$branch" "$rsession" "$verified")
+  if ! git merge --no-ff --no-edit -m "$msg" "$branch" >/dev/null 2>&1; then
+    git merge --abort >/dev/null 2>&1 || true
+    refuse "merge conflicts between '$base' and '$branch' — resolve manually or re-dispatch"
+  fi
+  sha=$(git rev-parse --short HEAD)
+  echo "merged:  $branch -> $base @ $sha (--no-ff)"
+  echo "run:     $run_id  model: $rmodel  spec: $rspec"
+  echo "undo:    oc-undo"
+  echo "branch '$branch' and worktree $WORKTREES_DIR/$branch were left in place."
+  exit "$EX_OK"
+fi
+
+# ================================================================ DISPATCH MODE
+[[ -n "$spec" ]] || { usage >&2; die "$EX_SPEC" "--spec is required"; }
+spec_problems=$(check_spec) && spec_ok=1 || spec_ok=0
+spec_abs=$(readlink -f "$spec" 2>/dev/null || echo "$spec")
+spec_rel=$(realpath --relative-to="$repo_root" "$spec_abs" 2>/dev/null || echo "$spec")
+
+# Where does this run live? Three cases:
+#   --session <id>          resume: reuse the worktree recorded for that session
+#   --session new --branch  new session, existing worktree (post-image-limit continuation)
+#   (neither)               fresh branch + worktree off current HEAD
+resume=0; reuse_wt=0
+if [[ -n "$session" && "$session" != "new" ]]; then
+  dead=$(find_run ".session_id == \"$session\" and .dead == true")
+  [[ -z "$dead" ]] || die "$EX_IMAGES" "session $session is recorded as dead (image limit) in $dead — it can never be retried. Start a fresh session: --session new --branch <branch>"
+  rec=$(find_run ".session_id == \"$session\"") || true
+  [[ -n "$rec" ]] || die "$EX_ERR" "no run record in $RUNS_DIR for session $session"
+  branch=$(jq -r .branch "$rec"); base_branch=$(jq -r .base_branch "$rec"); base_sha=$(jq -r .base_sha "$rec")
+  resume=1; reuse_wt=1
+elif [[ "$session" == "new" ]]; then
+  [[ -n "$branch" ]] || die "$EX_ERR" "--session new needs --branch <existing worktree branch>"
+  rec=$(find_run ".branch == \"$branch\"") || true
+  [[ -n "$rec" ]] || die "$EX_ERR" "no run record in $RUNS_DIR for branch $branch"
+  base_branch=$(jq -r .base_branch "$rec"); base_sha=$(jq -r .base_sha "$rec")
+  session=""; reuse_wt=1
+else
+  base_branch=$(git symbolic-ref --short HEAD 2>/dev/null) || die "$EX_ERR" "HEAD is detached; check out a branch first"
+  base_sha=$(git rev-parse HEAD)
+  if [[ -z "$branch" ]]; then
+    b=$(basename "$spec"); b="${b%.*}"; b=$(tr -c 'A-Za-z0-9_.-' '-' <<<"$b" | sed 's/-*$//')
+    branch="oc/${b:-task}-$(date +%H%M%S)"
+  fi
+fi
+worktree="$wt_root/$branch"
+run_id="$(date +%Y%m%dT%H%M%S)-$(tr '/' '_' <<<"$branch")"
+log="$runs_dir/$run_id.log"; diff_out="$runs_dir/$run_id.diff"; rec_out="$runs_dir/$run_id.json"
+
+if [[ $dry_run -eq 1 ]]; then
+  echo "model:    $model  (from $model_src)"
+  echo "branch:   $branch  (base: $base_branch @ ${base_sha:0:7})"
+  echo "worktree: $WORKTREES_DIR/$branch$( [[ $reuse_wt -eq 1 ]] && echo '  (existing)' )"
+  echo "session:  ${session:-<new>}"
+  echo "spec:     $spec_rel"
+  if [[ $spec_ok -eq 1 ]]; then echo "sections: ok (${REQUIRED_SECTIONS[*]})"
+  else echo "sections: REJECTED"; sed 's/^/  /' <<<"$spec_problems"; exit "$EX_SPEC"; fi
+  exit "$EX_OK"
+fi
+[[ $spec_ok -eq 1 ]] || die "$EX_SPEC" "spec rejected:"$'\n'"$spec_problems"
+
+# ---------------------------------------------------------------- worktree
+mkdir -p "$runs_dir"
+for entry in "$WORKTREES_DIR/" "$RUNS_DIR/"; do
+  grep -qxF "$entry" .gitignore 2>/dev/null || printf '%s\n' "$entry" >> .gitignore
+done
+if [[ $reuse_wt -eq 1 ]]; then
+  [[ -d "$worktree" ]] || die "$EX_ERR" "worktree $WORKTREES_DIR/$branch is gone — cannot resume"
+else
+  [[ ! -e "$worktree" ]] || die "$EX_ERR" "worktree $WORKTREES_DIR/$branch already exists. Pass --session <id> to resume it, --session new to reuse it, or choose another --branch"
+  ! git show-ref --verify --quiet "refs/heads/$branch" || die "$EX_ERR" "branch '$branch' already exists; choose another --branch"
+  git worktree add -q -b "$branch" "$worktree" HEAD 2>/dev/null || die "$EX_ERR" "git worktree add failed for $branch"
+fi
+
+# ---------------------------------------------------------------- opencode server
+# opencode reads stdin to EOF whenever stdin is not a TTY (inside an agent's shell
+# it is a socket that never closes), so every opencode/curl call below gets an
+# explicit stdin and a timeout.
+serve_pid=""; serve_log=$(mktemp)
+cleanup() { [[ -n "$serve_pid" ]] && kill "$serve_pid" 2>/dev/null; rm -f "$serve_log"; }
+trap cleanup EXIT
+url=""
+for attempt in 1 2 3 4 5; do
+  port=$(( 20000 + RANDOM % 40000 ))
+  : > "$serve_log"
+  ( cd "$worktree" && exec opencode serve --port "$port" </dev/null >"$serve_log" 2>&1 ) & serve_pid=$!
+  for _ in $(seq 1 80); do
+    grep -q 'listening on' "$serve_log" 2>/dev/null && break
+    kill -0 "$serve_pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  if grep -q 'listening on' "$serve_log" && curl -sf -m 3 "http://127.0.0.1:$port/global/health" >/dev/null 2>&1; then
+    url="http://127.0.0.1:$port"; break
+  fi
+  kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true; serve_pid=""
+done
+[[ -n "$url" ]] || die "$EX_ERR" "could not start opencode serve (last attempt on port $port):"$'\n'"$(tail -5 "$serve_log")"
+
+# Permissions are auto-approved for this session ONLY because the model is
+# confined to a throwaway git worktree: the base branch is untouched, every
+# change is a diff you review before merging, and oc-undo reverts a merge in
+# one command. Do not loosen this into running against the main checkout.
+if [[ $resume -eq 0 ]]; then
+  session=$(curl -sf -m 15 -X POST "$url/session?directory=$worktree" \
+      -H 'Content-Type: application/json' \
+      -d "$(jq -cn --arg t "oc-task $run_id" '{title:$t, permission:[{permission:"*",pattern:"*",action:"allow"}]}')" \
+    | jq -r '.id // empty') || true
+  [[ "$session" == ses_* ]] || die "$EX_ERR" "opencode did not return a session id"
+fi
+
+# ---------------------------------------------------------------- dispatch
+start=$(date +%s)
+set +e
+( cd "$worktree" && opencode run --attach "$url" --session "$session" --dir "$worktree" \
+    --model "$model" --format json --auto <"$spec_abs" >"$log" 2>&1 )
+oc_exit=$?
+set -e
+duration=$(( $(date +%s) - start ))
+kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true; serve_pid=""
+
+# ---------------------------------------------------------------- collect
+# Anything the model left uncommitted becomes a final checkpoint so the branch
+# diff is the whole story.
+if [[ -n "$(git -C "$worktree" status --porcelain)" ]]; then
+  git -C "$worktree" add -A >/dev/null 2>&1
+  git -C "$worktree" -c user.name=oc-task -c user.email=oc-task@localhost \
+      commit -q -m "oc-task: uncommitted changes at end of run $run_id" >/dev/null 2>&1 || true
+fi
+git diff "$base_sha" "$branch" > "$diff_out" 2>/dev/null || true
+numstat=$(git diff --numstat "$base_sha" "$branch" 2>/dev/null || true)
+head_sha=$(git rev-parse --short "$branch" 2>/dev/null || echo "")
+[[ "$(git rev-parse "$branch")" != "$base_sha" ]] || head_sha=""
+
+text=$(jq -r 'select(.type=="text") | .part.text // empty' "$log" 2>/dev/null || true)
+result=$(awk '/^## RESULT[[:space:]]*$/ {buf=""; on=1} on {buf = buf $0 "\n"} END {printf "%s", buf}' <<<"$text")
+errors=$(jq -r 'select(.type=="error") | (.error.name // "error") + ": " + (.error.data.message // (.error.data|tostring) // (.error|tostring))' "$log" 2>/dev/null | head -5 || true)
+[[ -n "$errors" ]] || errors=$(grep -vE '^\{' "$log" | grep -iE 'error|fail' | head -3 || true)
+err_events=$(jq -r 'select(.type=="error") | .type' "$log" 2>/dev/null || true)
+
+status=$EX_OK; status_txt="success"; dead=false
+if grep -qiE "$IMAGE_LIMIT_RE" <<<"$errors" || { [[ $oc_exit -ne 0 ]] && grep -qiE "$IMAGE_LIMIT_RE" "$log"; }; then
+  status=$EX_IMAGES; dead=true
+  status_txt="session poisoned by image limit — not resumable. Start a fresh session from checkpoint ${head_sha:-${base_sha:0:7}}."
+  jq -cn --arg s "$session" --arg r "$run_id" '{type:"oc-task",event:"session-dead",reason:"image-limit",session_id:$s,run_id:$r}' >> "$log"
+elif [[ $oc_exit -ne 0 ]] || { [[ -n "$err_events" ]] && [[ -z "$result" ]]; }; then
+  if grep -iqE "$RATE_LIMIT_RE" <<<"$errors"; then status=$EX_RATE; status_txt="rate limited by the provider — retry later, do not loop"
+  else status=$EX_ERR; status_txt="opencode errored"; fi
+elif [[ -z "$numstat" ]]; then
+  status=$EX_NOCHANGE; status_txt="completed but produced zero changes"
+fi
+
+jq -n --arg run_id "$run_id" --arg branch "$branch" --arg worktree "$worktree" \
+      --arg base_branch "$base_branch" --arg base_sha "$base_sha" --arg model "$model" \
+      --arg spec "$spec_rel" --arg session_id "$session" --argjson exit_code "$status" \
+      --argjson oc_exit "$oc_exit" --argjson duration "$duration" --argjson dead "$dead" \
+      --arg head_sha "$head_sha" --arg result "$result" --arg log "$log" --arg diff "$diff_out" \
+      '$ARGS.named' > "$rec_out"
+
+# ---------------------------------------------------------------- summary (stdout only)
+echo "run:      $run_id"
+echo "session:  $session"
+echo "model:    $model"
+echo "exit:     $status ($status_txt)"
+echo "duration: $(fmt_duration "$duration")"
+echo "branch:   $branch  (worktree $WORKTREES_DIR/$branch, base $base_branch @ ${base_sha:0:7})"
+echo "checkpoint: ${head_sha:-none}"
+if [[ -n "$numstat" ]]; then
+  echo "files:"; awk '$1=="-" {printf "  binary  %s\n", $3; next} {printf "  +%s -%s  %s\n", $1, $2, $3}' <<<"$numstat"
+else
+  echo "files:    none"
+fi
+[[ -z "$errors" ]] || { echo "errors:"; sed 's/^/  /' <<<"$errors" | cut -c1-400; }
+if [[ -n "$result" ]]; then echo "$result"; else echo "## RESULT: (none — model did not emit a RESULT block)"; fi
+echo "log:  $RUNS_DIR/$run_id.log"
+echo "diff: $RUNS_DIR/$run_id.diff"
+exit "$status"

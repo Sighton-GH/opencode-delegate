@@ -1,0 +1,21 @@
+{
+  "name": "opencode-delegate",
+  "description": "Delegate settled, mechanical implementation work to opencode's fast free models while Claude plans, prompts, and reviews.",
+  "owner": {
+    "name": "Sighton-GH",
+    "url": "https://github.com/Sighton-GH"
+  },
+  "plugins": [
+    {
+      "name": "opencode-delegate",
+      "source": "./plugins/opencode-delegate",
+      "description": "oc-task / oc-models / oc-undo plus the /delegate skill: hand a spec to a free opencode model in a git worktree, review the diff, merge with one revert point.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Sighton-GH"
+      },
+      "license": "MIT",
+      "keywords": ["opencode", "delegation", "worktree", "free-models"]
+    }
+  ]
+}

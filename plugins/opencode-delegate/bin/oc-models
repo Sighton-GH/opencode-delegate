@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# oc-models — list opencode models as provider/model, free ones first.
+#
+#   oc-models          all models, free-tagged first
+#   oc-models --free   free-tagged only
+#
+# "Free" means the live catalog reports zero input AND output cost. Nothing
+# here is hardcoded: Zen's free tier rotates, so we always ask opencode.
+set -euo pipefail
+
+usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; }
+
+free_only=0
+for arg in "$@"; do
+  case "$arg" in
+    --free) free_only=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "oc-models: unknown argument: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+for dep in opencode jq; do
+  command -v "$dep" >/dev/null 2>&1 || { echo "oc-models: missing dependency: $dep" >&2; exit 1; }
+done
+
+# `opencode models --verbose` prints, per model, a bare "provider/model" line
+# followed by a pretty-printed JSON object. Drop the bare id lines and let jq
+# consume the resulting stream of objects. stdin is closed explicitly: opencode
+# reads stdin to EOF whenever it is not a TTY, and inside an agent's shell it
+# is usually a socket that never closes.
+opencode models --verbose </dev/null 2>/dev/null \
+  | grep -Ev '^[A-Za-z0-9_.-]+/[^[:space:]]+$' \
+  | jq -r --argjson free_only "$free_only" '
+      {
+        id:   (.providerID + "/" + .id),
+        free: ((.cost.input // 0) == 0 and (.cost.output // 0) == 0)
+      }
+      | select($free_only == 0 or .free)
+      | (if .free then "0" else "1" end) + "\t" + .id' \
+  | sort -t$'\t' -k1,1 -k2,2 \
+  | cut -f2

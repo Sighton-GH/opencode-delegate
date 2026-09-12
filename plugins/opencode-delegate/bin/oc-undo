@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# oc-undo — revert the most recent `oc-task --merge` commit.
+#
+#   oc-undo          revert the newest oc-task merge (refuses on a dirty tree)
+#   oc-undo --list   show recent oc-task merges without reverting
+#
+# oc-task merges are --no-ff commits carrying an "oc-task-run: <id>" trailer,
+# so there is exactly one commit to revert and it is easy to find.
+set -euo pipefail
+
+MARKER="oc-task-run:"
+usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; }
+die()   { echo "oc-undo: $*" >&2; exit 1; }
+
+list_only=0
+for arg in "$@"; do
+  case "$arg" in
+    --list) list_only=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; die "unknown argument: $arg" ;;
+  esac
+done
+command -v git >/dev/null 2>&1 || die "missing dependency: git"
+git rev-parse --show-toplevel >/dev/null 2>&1 || die "not inside a git repository"
+
+if [[ $list_only -eq 1 ]]; then
+  for h in $(git log --merges -n 10 --grep="^$MARKER" --format=%h); do
+    body=$(git log -1 --format=%B "$h")
+    undone=""; git log --format=%B "$h..HEAD" | grep -q "This reverts commit $(git rev-parse "$h")" && undone="  [reverted]"
+    printf '%s  %s  run %s%s\n    model %s   spec %s   branch %s\n' "$h" "$(git log -1 --format=%ad --date=short "$h")" \
+      "$(sed -n "s/^$MARKER //p" <<<"$body" | head -1)" "$undone" \
+      "$(sed -n 's/^model: //p' <<<"$body" | head -1)" "$(sed -n 's/^spec: //p' <<<"$body" | head -1)" \
+      "$(sed -n 's/^branch: //p' <<<"$body" | head -1)"
+  done
+  exit 0
+fi
+
+sha=$(git log --merges -n 1 --grep="^$MARKER" --format=%H)
+[[ -n "$sha" ]] || die "no oc-task merge commit found in history"
+full_body=$(git log -n 1 --format=%B "$sha")
+run_id=$(sed -n "s/^$MARKER //p" <<<"$full_body" | head -1)
+model=$(sed -n 's/^model: //p' <<<"$full_body" | head -1)
+spec=$(sed -n 's/^spec: //p' <<<"$full_body" | head -1)
+branch=$(sed -n 's/^branch: //p' <<<"$full_body" | head -1)
+
+# Already undone? A prior revert of this exact sha means there is nothing to do.
+if git log --format=%B "$sha..HEAD" | grep -q "This reverts commit $sha"; then
+  die "merge $(git rev-parse --short "$sha") (run $run_id) was already reverted"
+fi
+[[ -z "$(git status --porcelain --untracked-files=no)" ]] || die "working tree is dirty; commit or stash first"
+
+git revert --no-edit -m 1 "$sha" >/dev/null 2>&1 \
+  || { git revert --abort >/dev/null 2>&1 || true; die "revert of $(git rev-parse --short "$sha") hit conflicts; aborted"; }
+
+echo "reverted: $(git rev-parse --short "$sha")  ($run_id)"
+echo "spec:     $spec"
+echo "model:    $model"
+echo "branch:   $branch  (still exists; the worktree under .oc-worktrees/ is untouched)"
+echo "revert commit: $(git rev-parse --short HEAD)"
