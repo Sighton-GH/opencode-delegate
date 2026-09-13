@@ -1,6 +1,6 @@
 {
   "name": "opencode-delegate",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Delegate settled, mechanical implementation work to opencode's fast free models (Muse Spark 1.3 by default) in an isolated git worktree; Claude writes the spec, reviews the diff, verifies, and merges.",
   "author": {
     "name": "Sighton-GH"

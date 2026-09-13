@@ -75,7 +75,11 @@ elif [[ -n "$config_model" ]];                then model="$config_model";       
 else                                               model="$DEFAULT_MODEL";          model_src="built-in default"
 fi
 [[ "$model" == */* ]] || die "$EX_ERR" "model must be provider/model, got: $model"
-provider_id="${model%%/*}"; model_id="${model#*/}"
+# Fail fast on a model that is not in the live catalog (free-tier ids rotate);
+# otherwise it only surfaces as a generic server error after the worktree exists.
+if ! opencode models </dev/null 2>/dev/null | grep -qxF "$model"; then
+  die "$EX_ERR" "model '$model' (from $model_src) is not in opencode's catalog. Free models right now:"$'\n'"$(opencode models </dev/null 2>/dev/null | grep -E -- '-free$|big-pickle' | sed 's/^/  /')"$'\n'"Pick one with --model, or run: oc-models --free --verbose"
+fi
 
 # ---------------------------------------------------------------- repo
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || die "$EX_ERR" "not inside a git repository"

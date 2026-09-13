@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # oc-models — list opencode models as provider/model, free ones first.
 #
-#   oc-models          all models, free-tagged first
-#   oc-models --free   free-tagged only
+#   oc-models             all models, free-tagged first
+#   oc-models --free      free-tagged only
+#   oc-models --verbose   tab-separated: id, context window, toolcall, reasoning, release date
 #
 # "Free" means the live catalog reports zero input AND output cost. Nothing
 # here is hardcoded: Zen's free tier rotates, so we always ask opencode.
 set -euo pipefail
 
-usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; }
 
-free_only=0
+free_only=0; verbose=0
 for arg in "$@"; do
   case "$arg" in
     --free) free_only=1 ;;
+    --verbose|-v) verbose=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "oc-models: unknown argument: $arg" >&2; usage >&2; exit 2 ;;
   esac
@@ -30,12 +32,17 @@ done
 # is usually a socket that never closes.
 opencode models --verbose </dev/null 2>/dev/null \
   | grep -Ev '^[A-Za-z0-9_.-]+/[^[:space:]]+$' \
-  | jq -r --argjson free_only "$free_only" '
+  | jq -r --argjson free_only "$free_only" --argjson verbose "$verbose" '
       {
         id:   (.providerID + "/" + .id),
-        free: ((.cost.input // 0) == 0 and (.cost.output // 0) == 0)
+        free: ((.cost.input // 0) == 0 and (.cost.output // 0) == 0),
+        ctx:  (.limit.context // 0),
+        tool: (if .capabilities.toolcall then "yes" else "no" end),
+        reason: (if .capabilities.reasoning then "yes" else "no" end),
+        date: (.release_date // "")
       }
       | select($free_only == 0 or .free)
-      | (if .free then "0" else "1" end) + "\t" + .id' \
+      | (if .free then "0" else "1" end) + "\t" + .id
+        + (if $verbose == 1 then "\t" + (.ctx|tostring) + "\ttoolcall=" + .tool + "\treasoning=" + .reason + "\t" + .date else "" end)' \
   | sort -t$'\t' -k1,1 -k2,2 \
-  | cut -f2
+  | cut -f2-

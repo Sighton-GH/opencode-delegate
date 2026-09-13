@@ -11,7 +11,8 @@ machine and works in every project.
 
 ## How it works
 
-1. You type `/delegate` in Claude Code and describe the task.
+1. You type `/delegate` in Claude Code and describe the task — or Claude
+   notices a task fits and proposes it.
 2. Claude runs a triage gate. If the task isn't a good fit (see
    [When it fires](#when-it-fires)), Claude says which condition failed and
    does the work itself.
@@ -105,10 +106,11 @@ claude plugin update opencode-delegate
 
 ## When it fires
 
-`/delegate` is user-invoked only (`disable-model-invocation: true` in the
-skill's frontmatter). Claude will not propose delegation on its own. Flip that
-field to `false` in `plugins/opencode-delegate/skills/delegate/SKILL.md` if
-you later trust the specs enough to let Claude suggest it.
+Two ways in: you type `/delegate`, or Claude decides on its own that a task
+fits and says so ("This looks delegable — running the triage gate."). The
+skill's `disable-model-invocation` is `false`; set it to `true` in
+`plugins/opencode-delegate/skills/delegate/SKILL.md` if you'd rather Claude
+never propose it. Either way nothing is dispatched until you approve the spec.
 
 Once invoked, Claude dispatches only if ALL of these hold — verbatim from the
 skill:
@@ -212,13 +214,26 @@ All three live in `plugins/opencode-delegate/bin/`. Each prints usage with
 ### `oc-models`
 
 ```
-oc-models          all models, one provider/model per line, free ones first
-oc-models --free   free only
+oc-models             all models, one provider/model per line, free ones first
+oc-models --free      free only
+oc-models --verbose   add columns: context window, toolcall, reasoning, release date
 ```
 
 "Free" means the live opencode catalog reports zero input and output cost.
 Nothing is hardcoded — Zen's free tier rotates, so ask Claude "what can you
 delegate to right now?" and it runs this.
+
+**When the default model disappears.** Before every dispatch Claude checks
+`oc-models --free`. If `opencode/muse-spark-1.3-contributor-free` is gone it
+picks the best free replacement itself using `--verbose`: a newer
+`muse-spark-*` free variant first, otherwise the free model with
+`toolcall=yes` and the largest context window (newest release wins ties),
+and tells you which one and why when it shows the spec. It never picks a
+model without tool calling (it couldn't edit files) and never silently falls
+back to a paid one. `oc-task` also refuses any model id that isn't in the
+live catalog, so a stale choice fails immediately instead of mid-run. To
+pin a replacement yourself, put `model=PROVIDER/MODEL` in
+`~/.config/oc-delegate/config`.
 
 ### `oc-task`
 

@@ -1,7 +1,7 @@
 ---
 name: delegate
-description: Delegate a large, already-designed implementation task to a fast free model via opencode, then review the diff and merge. For multi-file mechanical work where the design is already settled.
-disable-model-invocation: true
+description: Delegate a large, already-designed implementation task to a fast free model via opencode, then review the diff and merge. Use when the design is settled and the work is mechanical across 3+ files or >100 lines (boilerplate, CRUD endpoints, migrations of a pattern across files, test suites for known behaviour) and a test/typecheck/build command exists to verify it. Not for design, debugging, or anything needing images.
+disable-model-invocation: false
 ---
 
 # /delegate
@@ -11,7 +11,11 @@ You are the planner and reviewer. A free opencode model (default: Muse Spark
 throwaway git worktree. Three commands are on your PATH: `oc-task`,
 `oc-models`, `oc-undo`. Read `oc-task --help` if you need the exit codes.
 
-Follow the five steps in order. Step 1 may abort the whole thing.
+This skill can fire on its own judgment as well as on `/delegate`. Either
+way, follow the five steps in order; step 1 may abort the whole thing, and
+step 2 always waits for the user before anything is dispatched. When you
+invoke it yourself, say so in one line ("This looks delegable — running the
+triage gate.") so the user knows why the workflow changed.
 
 ## 1. Triage gate — runs first, may abort
 
@@ -36,8 +40,24 @@ has the required section names, the verbatim constraint text, and a worked
 example. Write the spec to a file in the repo (e.g. `.oc-runs/spec-<slug>.md`;
 `.oc-runs/` is gitignored) so the model can be handed the exact same text.
 
-Pick the model: the built-in default unless the user asked for another, or
-`oc-models --free` shows the default is gone. Sanity-check with
+Pick the model. Run `oc-models --free` first — Zen's free tier rotates and
+the built-in default (`opencode/muse-spark-1.3-contributor-free`) may be gone.
+Rules, in order:
+
+1. The user named a model → use it.
+2. The default is in the `--free` list → use it (pass nothing).
+3. Otherwise choose the best free model yourself and pass it with `--model`.
+   Run `oc-models --free --verbose` (columns: id, context window, toolcall,
+   reasoning, release date) and prefer, in order: a newer `muse-spark-*`
+   free variant; then any free model with `toolcall=yes` and the largest
+   context window, breaking ties by newest release date. Never pick a model
+   with `toolcall=no` — it cannot edit files. Tell the user which model you
+   chose and why in one line when you show the spec.
+4. Nothing free has toolcall → stop and tell the user; do not dispatch a paid
+   model without being asked.
+
+`oc-task` refuses a model id that is not in the live catalog, so a stale
+choice fails fast rather than mid-run. Sanity-check with
 `oc-task --spec <path> --dry-run` — it prints the resolved model and the
 section check without dispatching.
 

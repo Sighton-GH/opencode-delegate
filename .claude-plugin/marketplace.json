@@ -10,7 +10,7 @@
       "name": "opencode-delegate",
       "source": "./plugins/opencode-delegate",
       "description": "oc-task / oc-models / oc-undo plus the /delegate skill: hand a spec to a free opencode model in a git worktree, review the diff, merge with one revert point.",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "author": {
         "name": "Sighton-GH"
       },
