@@ -1,33 +1,48 @@
 # opencode-delegate
 
-A Claude Code plugin that hands settled, mechanical implementation work to
-[opencode](https://opencode.ai)'s fast free models — Muse Spark 1.3 by
-default — while Claude keeps doing the planning, prompting, and reviewing.
+A Claude Code plugin that runs **opencode-driven development**: Claude
+brainstorms, writes the plan, and writes every brief; [opencode](https://opencode.ai)
+sessions on free models — Muse Spark 1.3 by default — implement each task,
+review each task, and review the whole branch. It is a mirror of
+superpowers' `subagent-driven-development` with opencode in every subagent
+seat.
 
-Free fast models do the typing. Claude does the thinking and the reviewing.
+Claude thinks and adjudicates. opencode models do the engineering. You
+approve the plan once.
 
 This repo is also a Claude Code plugin marketplace, so it installs on any
 machine and works in every project.
 
 ## How it works
 
-1. You type `/delegate` in Claude Code and describe the task — or Claude
-   notices a task fits and proposes it.
-2. Claude runs a triage gate. If the task isn't a good fit (see
-   [When it fires](#when-it-fires)), Claude says which condition failed and
-   does the work itself.
-3. Claude writes a spec from a fixed template and shows it to you for
-   approval.
-4. `oc-task` creates a git worktree on a new branch, runs opencode in it with
-   permissions auto-approved (safe only because the worktree is a sandbox),
-   and prints a compact summary: session id, exit status, duration, files
-   changed, the model's own `## RESULT` block, the last checkpoint commit,
-   and paths to the full log and diff.
-5. Claude reads the diff, re-runs the verification command itself in the
-   worktree (it never trusts the model's claim), and either merges with
-   `oc-task --merge`, sends a short correction spec back to the same session,
-   or hands the task back to you.
-6. Every merge is `--no-ff`, so `oc-undo` reverts it in one command.
+1. You ask for something worth a plan — a feature, a refactor, a test
+   suite. Claude invokes the skill itself (or you type
+   `/opencode-driven-development`).
+2. Claude brainstorms with you until the design is settled, writes an
+   implementation plan (file map, bite-sized tasks with the code and tests
+   spelled out), and shows it to you. **You approve the plan once.**
+3. For each task, Claude writes a brief and runs `oc-task`. That creates a
+   git worktree on branch `oc/<plan>` (first task) and dispatches a fresh
+   opencode session per task inside it, permissions auto-approved because
+   the worktree is the sandbox. The model implements, commits per step, runs
+   the verification command, and ends with a `## RESULT` block.
+4. Claude re-runs the verification command itself, then dispatches an
+   opencode **reviewer** (`--role review`, opencode's read-only `plan` agent)
+   with the task's diff. Findings go into a fix loop — resume the same
+   session up to three times, then a fresh session on a different free
+   model — with a scoped re-review after every fix. A ledger in `.oc-runs/`
+   records every decision.
+5. After the last task, a final whole-branch review on the strongest free
+   model. Then Claude reports every ruling it made and offers: merge now
+   (`oc-task --merge`, `--no-ff`, one revert point via `oc-undo`), open a
+   PR, or leave the branch.
+
+Nothing stops for you between plan approval and the end except the four
+things that should: a destructive operation, a security-sensitive action, a
+side effect outside the worktree (merge/push/publish), or a plan so broken
+every path is a guess. Tasks touching **auth, secrets, crypto, or payments**
+get one extra question: whether you're OK sending that code to an opencode
+model.
 
 ## Prerequisites
 
@@ -36,7 +51,7 @@ Install these before the plugin. The plugin does not carry any of them.
 | Tool | Why | Check |
 |---|---|---|
 | Claude Code 2.1+ | plugin host | `claude --version` |
-| [opencode](https://opencode.ai) 1.18+ | runs the model | `opencode --version` |
+| [opencode](https://opencode.ai) 1.18+ | runs the models | `opencode --version` |
 | git 2.x | worktrees, merges, reverts | `git --version` |
 | jq | parses opencode's JSON | `jq --version` |
 | curl | talks to opencode's local server | `curl --version` |
@@ -44,10 +59,15 @@ Install these before the plugin. The plugin does not carry any of them.
 
 **opencode must be installed *and authenticated* separately.** Authentication
 is machine state — a credential file in your home directory — and the plugin
-does not carry it. Run `opencode providers` (alias `opencode auth`) and make
-sure a provider is listed. The default model uses the OpenCode Zen provider;
-`opencode providers list` should show `OpenCode Zen`. If it doesn't, run
+does not carry it. Run `opencode providers list` and make sure `OpenCode
+Zen` is listed (the free models live there). If it isn't, run
 `opencode auth login` and pick it.
+
+**Recommended companion:** the `superpowers` plugin. When it is installed
+the skill uses `superpowers:brainstorming`, `superpowers:writing-plans`, and
+`superpowers:finishing-a-development-branch` for those steps. Without it,
+built-in fallbacks cover the same ground (a condensed plan template ships
+in the skill).
 
 If `jq` is missing on Linux and you can't `apt install` it, a static binary
 works: download `jq-linux-amd64` from the
@@ -69,8 +89,7 @@ it's live, ask Claude to run `oc-models --free` — you should see a list of
 enabled for this session; check `/plugin`.
 
 Plugins add `bin/` to the PATH the Bash tool uses, so `oc-task`, `oc-models`,
-and `oc-undo` are bare commands for Claude in every project, and for you if
-you run them from Claude's shell.
+and `oc-undo` are bare commands for Claude in every project.
 
 `claude plugin details opencode-delegate` shows the plugin's component
 inventory and its projected per-session token cost.
@@ -106,110 +125,181 @@ claude plugin update opencode-delegate
 
 ## When it fires
 
-Two ways in: you type `/delegate`, or Claude decides on its own that a task
-fits and says so ("This looks delegable — running the triage gate."). The
-skill's `disable-model-invocation` is `false`; set it to `true` in
-`plugins/opencode-delegate/skills/delegate/SKILL.md` if you'd rather Claude
-never propose it. Either way nothing is dispatched until you approve the spec.
+The skill fires whenever Claude would write a plan with two or more tasks —
+the same moment superpowers' `subagent-driven-development` would fire — and
+takes its place. One-line fixes, investigation, and questions stay with
+Claude. You can also invoke it directly with `/opencode-driven-development`.
 
-Once invoked, Claude dispatches only if ALL of these hold — verbatim from the
-skill:
+If you'd rather Claude never start it on its own, set
+`disable-model-invocation: true` in
+`plugins/opencode-delegate/skills/opencode-driven-development/SKILL.md`.
 
-- touches 3+ files, or >100 lines of new code
-- the design is already decided — you can state exact paths and signatures
-- a runnable verification command exists (tests, typecheck, build)
-- it is mechanical execution of a settled design, not design discovery
-- it can plausibly finish in under ~20 minutes of model time. Longer sessions
-  accumulate images and die unrecoverably. Split anything larger.
-- it does not require looking at images, screenshots, or design comps
-
-If any fail, Claude names the failing condition and implements it itself. If
-the only problem is size, it proposes a split into sequential dispatches.
+The skill's posture, in its own words: *opencode models are capable
+engineers, not throwaway ones. Your leverage is the brief. When a run
+disappoints, the first suspect is the brief, not the model.* Claude does
+not decide work is "too hard for opencode" and do it itself; it writes a
+better brief.
 
 ## Worked example
 
-You, in a TypeScript/Express repo where the design is already agreed:
+You, in a TypeScript/Express repo:
 
-> /delegate Add `DELETE /api/projects/:id` — soft-delete the project and its
-> memberships, owner-only, with tests. Same shape as the teams routes.
+> Add soft-delete for projects: `DELETE /api/projects/:id`, owner-only,
+> memberships go too, with tests.
 
-**Triage.** Claude checks the gate: 4 files, settled design, `vitest` +
-`tsc` exist, no images, well under 20 minutes. Passes.
+**Brainstorm.** Claude asks the two questions that change the design (hard
+vs soft delete of memberships; who counts as owner), proposes an approach,
+you confirm.
 
-**Spec.** Claude writes `.oc-runs/spec-project-delete.md` from the template
-(the full example is at the bottom of
-[`spec-template.md`](plugins/opencode-delegate/skills/delegate/spec-template.md)),
-runs `oc-task --spec .oc-runs/spec-project-delete.md --dry-run` to confirm the
-model and section check, and shows you both:
+**Plan.** Claude writes `docs/superpowers/plans/2026-09-12-project-soft-delete.md`:
+a file map, global constraints ("errors use `HttpError` from
+`src/errors.ts`"), and three tasks — service function, route + registration,
+tests — each with exact signatures and the test cases named. You read it and
+say "go". That is the last approval.
 
-```
-model:    opencode/muse-spark-1.3-contributor-free  (from built-in default)
-branch:   oc/spec-project-delete-141502  (base: main @ 9c1f2ab)
-worktree: .oc-worktrees/oc/spec-project-delete-141502
-session:  <new>
-spec:     .oc-runs/spec-project-delete.md
-sections: ok (Objective Files Tasks Verification Definition of done Required output)
-```
-
-You say "go".
-
-**Dispatch.** Claude runs `oc-task --spec .oc-runs/spec-project-delete.md
---branch oc/project-delete` and waits. Nothing else happens until it returns:
+**Task 1.** Claude writes `.oc-runs/project-soft-delete/task-1-brief.md`
+(objective, context naming `teamService.ts` as the pattern, constraints,
+files, interfaces, numbered steps, verification, RESULT format) and runs:
 
 ```
-run:      20260912T141530-oc_project-delete
+oc-task --brief .oc-runs/project-soft-delete/task-1-brief.md --branch oc/project-soft-delete
+```
+
+```
+run:      20260912T141530-oc_project-soft-delete  (role: implement)
 session:  ses_f67fcd9c5ffeuPtAzaubTh8qph
 model:    opencode/muse-spark-1.3-contributor-free
 exit:     0 (success)
-duration: 4m12s
-branch:   oc/project-delete  (worktree .oc-worktrees/oc/project-delete, base main @ 9c1f2ab)
+duration: 3m41s
+branch:   oc/project-soft-delete  (worktree .oc-worktrees/oc/project-soft-delete, base main @ 9c1f2ab)
 checkpoint: 3e9f99a
 files:
   +38 -0  src/services/projectService.ts
-  +21 -1  src/routes/projects.ts
-  +2 -0   src/routes/index.ts
-  +71 -0  tests/routes/projects.delete.test.ts
 ## RESULT
-Files changed: src/services/projectService.ts, src/routes/projects.ts, src/routes/index.ts, tests/routes/projects.delete.test.ts
-Commands run and their outcome: npx vitest run tests/routes/projects.delete.test.ts (4 passed); npx tsc --noEmit (clean)
+Status: DONE
+Files changed: src/services/projectService.ts
+Commits: 3e9f99a Step 1: add softDeleteProject
+Commands run and their outcome: npx tsc --noEmit (clean)
 Could not complete: none
 Assumptions made: none
-log:  .oc-runs/20260912T141530-oc_project-delete.log
-diff: .oc-runs/20260912T141530-oc_project-delete.diff
+Concerns or questions: none
+log:  .oc-runs/20260912T141530-oc_project-soft-delete.log
+diff: .oc-runs/20260912T141530-oc_project-soft-delete.diff
 ```
 
-**Review.** Claude reads the RESULT block, then the `.diff`. Every file is in
-the spec's Files list; no dependency changed. It runs the verification
-command itself:
+Claude re-runs `npx tsc --noEmit` in the worktree, writes a review brief
+pointing at that `.diff`, and dispatches the reviewer:
 
 ```
-cd .oc-worktrees/oc/project-delete && npx vitest run tests/routes/projects.delete.test.ts && npx tsc --noEmit
-```
-
-**Merge.** It passes, so:
-
-```
-oc-task --merge --branch oc/project-delete --verified "npx vitest run tests/routes/projects.delete.test.ts && npx tsc --noEmit"
+oc-task --brief .oc-runs/project-soft-delete/task-1-review-brief.md --role review --branch oc/project-soft-delete --session new
 ```
 
 ```
-merged:  oc/project-delete -> main @ c37db3d (--no-ff)
-run:     20260912T141530-oc_project-delete  model: opencode/muse-spark-1.3-contributor-free  spec: .oc-runs/spec-project-delete.md
+## RESULT
+Spec: FAIL
+Quality: NEEDS_WORK
+Findings:
+- [Important] src/services/projectService.ts:31 — memberships updated outside the transaction — move the updateMany inside prisma.$transaction
+Cannot verify from diff:
+- none
+```
+
+**Fix round 1.** Claude resumes the implementer's session with a fix brief
+(`--session ses_f67fcd9c5ffeuPtAzaubTh8qph`), re-runs the typecheck, and
+dispatches a scoped re-review of the fix diff: `ALL ADDRESSED`. Ledger:
+`Task 1: fix round 1/5 (1 addressed, 0 open; commits 3e9f99a..a41c0d2)`,
+then `Task 1: complete`.
+
+**Tasks 2 and 3** run the same way with `--session new`. **Final review**:
+`oc-task --branch-diff --branch oc/project-soft-delete` → whole-branch diff
+file → reviewer on a different free model → `MERGEABLE`.
+
+**Finish.** Claude lists the rulings it made, re-runs the full verification
+command on the branch, and offers merge / PR / leave. You say merge:
+
+```
+oc-task --merge --branch oc/project-soft-delete --verified "npx vitest run && npx tsc --noEmit"
+merged:  oc/project-soft-delete -> main @ c37db3d (--no-ff)
 undo:    oc-undo
-branch 'oc/project-delete' and worktree .oc-worktrees/oc/project-delete were left in place.
 ```
-
-Claude reports the sha and that `oc-undo` reverses it, and stops.
-
-Had the diff touched a file outside the spec, or had the tests failed, Claude
-would have written a one-screen correction spec and re-dispatched with
-`--session ses_f67fcd9c5ffeuPtAzaubTh8qph` — at most twice — before doing the
-work itself and telling you delegation failed.
 
 ## Command reference
 
 All three live in `plugins/opencode-delegate/bin/`. Each prints usage with
-`--help`.
+`--help`. Replace `PATH`, `NAME`, `ID`, `COMMAND`, `PROVIDER/MODEL` with
+real values.
+
+### `oc-task`
+
+```
+oc-task --brief PATH [--role implement|review] [--model PROVIDER/MODEL] [--branch NAME] [--session ID|new] [--dry-run]
+oc-task --branch-diff --branch NAME
+oc-task --merge (--branch NAME | --session ID) --verified "COMMAND"
+```
+
+**Dispatch** (`--brief`): validates the brief, creates or reuses the
+worktree, starts a private `opencode serve` on a random port, creates the
+session over its HTTP API, runs `opencode run --attach … --auto` with the
+brief on stdin, commits anything left uncommitted as a final checkpoint,
+and prints the summary. Files:
+
+- `.oc-runs/RUNID.diff` — this run's changes only (commit list + diff with
+  10 lines of context) — the review package for that task
+- `.oc-runs/RUNID.log` — raw JSON event stream; read only when a run fails
+- `.oc-runs/RUNID.json` — run record (branch, base, session, role, exit, RESULT)
+
+Worktree rules: the first run on a branch creates `.oc-worktrees/NAME` off
+current HEAD. `--session ID` resumes that session in its worktree.
+`--session new --branch NAME` starts a fresh session in the existing
+worktree (every task after the first; continuation after an image-limit
+death). Anything else with an existing worktree is refused.
+
+`--role review` runs opencode's built-in read-only `plan` agent: it can read,
+grep, and run commands, but every edit is denied. Required brief sections
+differ per role:
+
+| role | required `#` sections |
+|---|---|
+| implement | Objective, Files, Tasks, Verification, Definition of done, Required output |
+| review | Objective, Diff under review, Required output |
+
+Model precedence: `--model` > `$OC_DELEGATE_MODEL` > `model=` line in
+`~/.config/oc-delegate/config` (respects `$XDG_CONFIG_HOME`; created on first
+run) > built-in `opencode/muse-spark-1.3-contributor-free`. Any id not in
+the live catalog is refused immediately with the current free list.
+
+`--dry-run` prints the resolved model, branch, worktree, and section check
+without creating anything.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | success (implement: changes produced; review: RESULT block present) |
+| 1 | opencode errored, or a setup problem |
+| 2 | brief rejected — missing or malformed sections |
+| 3 | implement run completed but produced zero changes |
+| 4 | session poisoned by image limit — unrecoverable |
+| 5 | rate limited by the provider |
+
+On any non-zero exit the worktree stays in place; oc-task never cleans up
+after a failure. `.oc-worktrees/` and `.oc-runs/` are added to `.gitignore`
+on first run (left uncommitted; the one change `--merge` and `oc-undo`
+tolerate in an otherwise clean tree).
+
+**`--branch-diff`** writes the whole-branch diff (base..branch, with commit
+list and stat) to `.oc-runs/TIMESTAMP-NAME.branch.diff` and prints the path.
+It is the final reviewer's input.
+
+**`--merge`** merges the branch into the base it forked from with `--no-ff`.
+It refuses, with a specific reason, unless all of these hold: you are on the
+base branch with a clean tree; the latest *implement* run on the branch
+exited 0 and has a parseable `## RESULT` block; you passed
+`--verified "COMMAND"` (your attestation that you re-ran verification
+yourself — oc-task does not trust the model); every changed file is named
+in the `# Files` section of some brief dispatched to that branch; and there
+are no conflicts. The commit carries `oc-task-run:`, `model:`, `spec:`,
+`branch:`, `session:`, `verified:` trailers. The branch is never deleted.
 
 ### `oc-models`
 
@@ -219,83 +309,18 @@ oc-models --free      free only
 oc-models --verbose   add columns: context window, toolcall, reasoning, release date
 ```
 
-"Free" means the live opencode catalog reports zero input and output cost.
-Nothing is hardcoded — Zen's free tier rotates, so ask Claude "what can you
-delegate to right now?" and it runs this.
+"Free" means the live catalog reports zero input and output cost. Nothing is
+hardcoded — Zen's free tier rotates. Ask Claude "what can you delegate to
+right now?" and it runs this.
 
-**When the default model disappears.** Before every dispatch Claude checks
-`oc-models --free`. If `opencode/muse-spark-1.3-contributor-free` is gone it
-picks the best free replacement itself using `--verbose`: a newer
-`muse-spark-*` free variant first, otherwise the free model with
-`toolcall=yes` and the largest context window (newest release wins ties),
-and tells you which one and why when it shows the spec. It never picks a
-model without tool calling (it couldn't edit files) and never silently falls
-back to a paid one. `oc-task` also refuses any model id that isn't in the
-live catalog, so a stale choice fails immediately instead of mid-run. To
-pin a replacement yourself, put `model=PROVIDER/MODEL` in
-`~/.config/oc-delegate/config`.
-
-### `oc-task`
-
-```
-oc-task --spec PATH [--model PROVIDER/MODEL] [--branch NAME] [--session ID|new] [--dry-run]
-oc-task --merge (--branch NAME | --session ID) --verified "COMMAND"
-```
-
-Replace `PATH`, `NAME`, `ID` and `COMMAND` with real values; don't type them
-literally.
-
-Model precedence: `--model` > `$OC_DELEGATE_MODEL` > `model=` line in
-`~/.config/oc-delegate/config` (respects `$XDG_CONFIG_HOME`; created on first
-run) > built-in default `opencode/muse-spark-1.3-contributor-free`.
-
-What a dispatch does, in order:
-
-1. Validates the spec: exists, non-empty, has `# Objective`, `# Files`,
-   `# Tasks`, `# Verification`, `# Definition of done`, `# Required output`.
-2. Adds `.oc-worktrees/` and `.oc-runs/` to `.gitignore` if absent. This
-   edit is left uncommitted; commit it whenever convenient. It is the one
-   change `--merge` and `oc-undo` tolerate in an otherwise clean tree.
-3. Creates `.oc-worktrees/NAME` on new branch `NAME` off current HEAD
-   (default name `oc/SPEC-BASENAME-HHMMSS`). An existing worktree is reused
-   only with `--session ID` (resume that session) or `--session new --branch
-   NAME` (fresh session, same worktree — for continuing after an image-limit
-   death).
-4. Starts a private `opencode serve` on a random port, creates the session
-   over its HTTP API with an allow-all permission ruleset, and runs
-   `opencode run --attach ... --session ID --auto` with the spec on stdin.
-5. Commits anything the model left uncommitted as a final checkpoint.
-6. Writes `.oc-runs/RUNID.log` (raw JSON event stream), `.oc-runs/RUNID.diff`
-   (branch vs base), `.oc-runs/RUNID.json` (run record), and prints the
-   summary.
-
-`--dry-run` prints the resolved model, branch, worktree, and section check,
-then exits without creating anything.
-
-Exit codes:
-
-| Code | Meaning |
-|---|---|
-| 0 | success, changes produced |
-| 1 | opencode errored (generic), or a setup problem |
-| 2 | spec rejected — missing or malformed |
-| 3 | completed but zero changes |
-| 4 | session poisoned by image limit — unrecoverable |
-| 5 | rate limited by the provider |
-
-On any non-zero exit the worktree stays in place. oc-task never cleans up
-after a failure.
-
-`--merge` merges the branch into the base it forked from with `--no-ff`. It
-refuses, with a specific reason, unless all of these hold: you are on the base
-branch with a clean tree (oc-task's own `.gitignore` edit is exempt); the
-latest run on that branch exited 0; that run has a parseable `## RESULT`
-block; you passed `--verified "COMMAND"` (your attestation that you re-ran
-the verification command yourself — oc-task does not trust the model);
-every changed file is named in the `# Files` section of a spec dispatched to
-that branch; and the merge has no conflicts. The commit message carries
-`oc-task-run:`, `model:`, `spec:`, `branch:`, `session:`, and `verified:`
-trailers. The branch is never deleted.
+**When the default model disappears.** The skill checks `oc-models --free`
+once per plan. If `opencode/muse-spark-1.3-contributor-free` is gone Claude
+picks the best free replacement using `--verbose`: a newer `muse-spark-*`
+free variant first, otherwise the free model with `toolcall=yes` and the
+largest context window (newest release wins ties), and records the choice
+in the ledger. It never picks a model without tool calling and never falls
+back to a paid one. To pin a replacement yourself, put
+`model=PROVIDER/MODEL` in `~/.config/oc-delegate/config`.
 
 ### `oc-undo`
 
@@ -305,9 +330,8 @@ oc-undo --list   show recent oc-task merges (and whether each was reverted)
 ```
 
 Finds the newest merge commit carrying the `oc-task-run:` trailer and runs
-`git revert -m 1` on it, printing the run id, spec path, and model so it's
-obvious what was undone. Refuses on a dirty tree (with the same `.gitignore`
-exemption as `--merge`) and on a merge that was already reverted.
+`git revert -m 1` on it, printing the run id, brief path, and model. Refuses
+on a dirty tree and on a merge already reverted.
 
 ## Troubleshooting
 
@@ -324,28 +348,26 @@ auto-recovery never fires. The session is unrecoverable, not merely errored.
 
 What oc-task does: exits 4, records the session id as dead in the run log and
 run record, and refuses `--session THAT-ID` forever. The worktree and its
-checkpoint commits are the recovered work. What Claude does (per the skill):
-reports the checkpoint sha, writes a continuation spec from the first
-incomplete task, and dispatches it with `--session new --branch NAME` into the
-same worktree.
+checkpoint commits are the recovered work. What Claude does: writes a
+continuation brief from the first incomplete step and dispatches it with
+`--session new --branch NAME` into the same worktree.
 
-Prevention is the spec's job: the verbatim "Do not read, open, or screenshot
-any image or binary file" constraint, and the under-20-minutes rule.
+Prevention is the brief's job: the verbatim "Do not read, open, or
+screenshot any image or binary file" constraint, and right-sized tasks.
 
 ### Rate limited (exit 5)
 
 Free-tier throttling mid-task is an expected condition, not a bug. oc-task
-exits 5 and Claude stops; it does not retry automatically. Wait, or pick
-another model from `oc-models --free` and re-dispatch with `--session ID` to
-continue where it stopped.
+exits 5 and Claude stops and tells you; it does not retry on its own. Wait,
+or pick another model from `oc-models --free` and resume with `--session ID`.
 
 ### "opencode did not return a session id" / "could not start opencode serve"
 
 opencode isn't authenticated, or something is wrong with the install. Run
 `opencode providers list` and `opencode run "say hi" < /dev/null` by hand.
 The `< /dev/null` matters: `opencode run` reads stdin to EOF whenever stdin is
-not a terminal, so inside an agent's shell (where stdin is a socket that never
-closes) it hangs silently without it. oc-task always redirects stdin for you.
+not a terminal, so inside an agent's shell (where stdin is a socket that
+never closes) it hangs silently without it. oc-task always redirects stdin.
 
 ### Worktree cleanup
 
@@ -357,19 +379,19 @@ git branch -D NAME
 ```
 
 `git worktree list` shows what's there. `.oc-runs/` is plain files; delete
-old ones whenever you like (but a run record is needed for `--merge` and
-`--session` on that branch).
+old runs whenever you like (a run record is needed for `--merge` and
+`--session` on that branch, and the plan's ledger lives there until the
+branch is finished).
 
 ### Undoing a merge
 
 `oc-undo`. It reverts only the newest oc-task merge; run `oc-undo --list`
-first if you're not sure which that is. To undo an older one, use the sha from
+first if you're not sure which that is. For an older one, use the sha from
 `--list` with `git revert -m 1 SHA` yourself.
 
 ### Reading a failed run's log
 
-`.oc-runs/RUNID.log` is opencode's raw JSON event stream, one event per line.
-Useful extracts:
+`.oc-runs/RUNID.log` is opencode's raw JSON event stream, one event per line:
 
 ```
 jq -r 'select(.type=="text") | .part.text' .oc-runs/RUNID.log      # the model's prose
@@ -380,12 +402,17 @@ jq -r 'select(.type=="tool_use") | .part.tool' .oc-runs/RUNID.log    # tools cal
 ## Layout
 
 ```
-.claude-plugin/marketplace.json          registers the plugin
+.claude-plugin/marketplace.json                      registers the plugin
 plugins/opencode-delegate/
   .claude-plugin/plugin.json
-  bin/oc-task  oc-models  oc-undo        on PATH when the plugin is enabled
-  skills/delegate/SKILL.md               the /delegate skill
-  skills/delegate/spec-template.md       the spec shape, with a worked example
+  bin/oc-task  oc-models  oc-undo                    on PATH when the plugin is enabled
+  skills/opencode-driven-development/
+    SKILL.md                                         the process (mirror of subagent-driven-development)
+    implementer-brief.md                             per-task brief template (+ fix-round variant)
+    task-reviewer-brief.md                           per-task review
+    re-review-brief.md                               scoped re-review after a fix round
+    final-reviewer-brief.md                          whole-branch review
+    plan-template.md                                 fallback when superpowers:writing-plans is absent
   README.md
 ```
 
