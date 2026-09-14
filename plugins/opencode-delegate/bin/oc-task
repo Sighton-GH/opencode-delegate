@@ -251,6 +251,11 @@ for p in "${copy_untracked[@]:-}"; do
   rel="${p#./}"; rel="${rel%/}"
   [[ -n "$rel" && "$rel" != "." ]] || die "$EX_ERR" "--copy-untracked: paths are relative to the repository root, got: $p"
   [[ -e "$repo_root/$rel" ]] || die "$EX_ERR" "--copy-untracked: no such path in the base checkout: $p"
+  # `--copy-untracked` exists for files a worktree cannot inherit. A tracked
+  # path is already in the worktree, and `cp -a` onto an existing directory
+  # would nest it as $rel/$rel, so refuse rather than silently mangle.
+  ! git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 \
+    || die "$EX_ERR" "--copy-untracked: $p is tracked — it is already in the worktree"
 done
 runs_dir="$repo_root/$RUNS_DIR"
 wt_root="$repo_root/$WORKTREES_DIR"

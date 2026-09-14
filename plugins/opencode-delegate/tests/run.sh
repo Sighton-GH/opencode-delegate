@@ -272,6 +272,13 @@ neq "a --copy-untracked path with .. is refused" 0 "$STATUS"
   && no "refusing a .. path creates no worktree" "absent" "present" \
   || ok "refusing a .. path creates no worktree"
 
+run_oc --brief "$brief" --branch oc/tracked --copy-untracked seed.txt
+neq "a tracked --copy-untracked path is refused" 0 "$STATUS"
+contains "the refusal says the path is tracked" "tracked" "$OUT"
+[[ -e "$FIX_REPO/.oc-worktrees/oc/tracked" ]] \
+  && no "refusing a tracked path creates no worktree" "absent" "present" \
+  || ok "refusing a tracked path creates no worktree"
+
 new_fixture envcount
 brief="$FIX_ROOT/brief.md"; write_brief "$brief"
 mkdir -p "$FIX_REPO/inputs"
