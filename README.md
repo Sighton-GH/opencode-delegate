@@ -233,8 +233,10 @@ real values.
 
 ```
 oc-task --brief PATH [--role implement|review] [--model PROVIDER/MODEL] [--branch NAME] [--session ID|new] [--dry-run]
+        [--idle-timeout SECONDS] [--copy-untracked PATH]...
+        [--link-node-modules|--no-link-node-modules]
 oc-task --branch-diff --branch NAME
-oc-task --merge (--branch NAME | --session ID) --verified "COMMAND"
+oc-task --merge (--branch NAME | --session ID) --verified "COMMAND" [-m MSG | --no-commit | --squash]
 ```
 
 **Dispatch** (`--brief`): validates the brief, creates or reuses the
@@ -251,8 +253,8 @@ and prints the summary. Files:
 Worktree rules: the first run on a branch creates `.oc-worktrees/NAME` off
 current HEAD. `--session ID` resumes that session in its worktree.
 `--session new --branch NAME` starts a fresh session in the existing
-worktree (every task after the first; continuation after an image-limit
-death). Anything else with an existing worktree is refused.
+worktree (every task after the first; continuation after a dead
+session). Anything else with an existing worktree is refused.
 
 `--role review` runs opencode's built-in read-only `plan` agent: it can read,
 grep, and run commands, but every edit is denied. Required brief sections
@@ -271,6 +273,31 @@ the live catalog is refused immediately with the current free list.
 `--dry-run` prints the resolved model, branch, worktree, and section check
 without creating anything.
 
+`--idle-timeout SECONDS` sets how long a run may produce no output at all
+before the watchdog kills it. Default 420 (7 minutes); `0` disables the
+watchdog. Also settable as `idle_timeout=` in
+`${XDG_CONFIG_HOME:-~/.config}/oc-delegate/config` or as
+`$OC_DELEGATE_IDLE_TIMEOUT`. Precedence: flag, then environment, then config,
+then built-in default — the same order as the model setting. The provider's
+explicit rate limit surfaces as an error and exits 5; the silent throttle
+stops emitting with no error and no end of turn, and before v0.4.0 it hung
+until an operator noticed. A killed run poisons its session (the reasoning
+state the provider expects back is lost), so exit 6 also records the session
+dead.
+
+`--copy-untracked PATH` (repeatable) copies a path from the base checkout into
+a freshly created worktree and keeps it out of the run's diff. A worktree forks
+from `HEAD`, so files a user just dropped in — often the very inputs a task is
+about — are simply missing from it. The copy is recorded in the run record's
+`provisioned` list and excluded from every git operation inside the worktree.
+
+`--link-node-modules` / `--no-link-node-modules` controls whether `node_modules`
+is symlinked from the base checkout into a fresh worktree. The default (`auto`)
+links it when the repo root has a `node_modules` directory. Because it is a
+symlink, `npx <tool>` can fail with `Permission denied`; call the CLI entry
+point directly instead (e.g. `node node_modules/@playwright/test/cli.js test`)
+and put that exact form in the brief's Verification section.
+
 Exit codes:
 
 | Code | Meaning |
@@ -279,13 +306,14 @@ Exit codes:
 | 1 | opencode errored, or a setup problem |
 | 2 | brief rejected — missing or malformed sections |
 | 3 | implement run completed but produced zero changes |
-| 4 | session poisoned by image limit — unrecoverable |
+| 4 | session unrecoverable — image limit or a poisoned reasoning state (never retried) |
 | 5 | rate limited by the provider |
+| 6 | stalled (no output for the idle timeout; session dead) |
 
-On any non-zero exit the worktree stays in place; oc-task never cleans up
-after a failure. `.oc-worktrees/` and `.oc-runs/` are added to `.gitignore`
-on first run (left uncommitted; the one change `--merge` and `oc-undo`
-tolerate in an otherwise clean tree).
+Non-zero exits leave the worktree in place, except a dispatch that fails before
+a session exists, which removes what it created. `.oc-worktrees/` and
+`.oc-runs/` are added to `.gitignore` on first run (left uncommitted; the one
+change `--merge` and `oc-undo` tolerate in an otherwise clean tree).
 
 **`--branch-diff`** writes the whole-branch diff (base..branch, with commit
 list and stat) to `.oc-runs/TIMESTAMP-NAME.branch.diff` and prints the path.
@@ -300,6 +328,24 @@ yourself — oc-task does not trust the model); every changed file is named
 in the `# Files` section of some brief dispatched to that branch; and there
 are no conflicts. The commit carries `oc-task-run:`, `model:`, `spec:`,
 `branch:`, `session:`, `verified:` trailers. The branch is never deleted.
+
+The three merge modes exist because the six refusals above are a genuine
+audit: before v0.4.0 a caller who needed a particular commit message or a
+squash had to integrate by hand and lost the audit entirely. All three run
+every refusal first, unchanged and in the same order; only the commit step
+differs.
+
+`-m MESSAGE` (`--message`) uses your subject instead of the generated `oc-task
+merge: BRANCH`. The `oc-task-run:` trailer is still written, so `oc-undo`
+still finds the merge. `--no-commit` runs every check, merges into the index
+and working tree, and stops without committing. The prepared message — subject
+and all trailers — is written to `.git/OC_TASK_MERGE_MSG`, so `git commit -F
+.git/OC_TASK_MERGE_MSG` reproduces exactly what the default path would have
+committed. A conflict still aborts the merge and refuses, leaving the tree as
+it was. `--squash` stages the branch's net change as an ordinary change set
+rather than a merge. It implies `--no-commit`. A squashed commit is not a
+merge commit, and `oc-undo` searches `git log --merges`, so it will not find
+one: it is the one way to lose the undo path.
 
 ### `oc-models`
 
@@ -361,6 +407,31 @@ Free-tier throttling mid-task is an expected condition, not a bug. oc-task
 exits 5 and Claude stops and tells you; it does not retry on its own. Wait,
 or pick another model from `oc-models --free` and resume with `--session ID`.
 
+### "stalled — no output for Ns" (exit 6)
+
+A run can stop producing output with no error at all: the assistant message
+exists, has zero parts, and `error: null`. That is a silent provider throttle,
+not a crash, and before v0.4.0 it hung until an operator noticed — one run
+burned 54 minutes that way. oc-task now watches the run log and kills a run
+that has produced nothing for `--idle-timeout` seconds (default 420).
+
+Killing a run poisons its session (see below), so exit 6 also marks the session
+dead. The checkpoint commits in the worktree are the recovered work: write a
+continuation brief from the first incomplete step and dispatch it with
+`--session new --branch NAME`. Raise `--idle-timeout` for tasks with genuinely
+long silent stretches, or set `idle_timeout=0` in the config to disable the
+watchdog.
+
+### "session poisoned — encrypted_content" (exit 4)
+
+An interrupted turn — a killed run, a dropped stream — loses the reasoning
+state the provider expects back on the next turn, and every later turn in that
+session fails instantly with ``reasoning `encrypted_content` was not issued to
+this caller``. Like the image limit, the session is unrecoverable rather than
+merely errored, so oc-task exits 4, records the session dead with
+`dead_reason: "encrypted-content"`, and refuses `--session THAT-ID` forever.
+Re-dispatch with `--session new --branch NAME`.
+
 ### "opencode did not return a session id" / "could not start opencode serve"
 
 opencode isn't authenticated, or something is wrong with the install. Run
@@ -382,6 +453,12 @@ git branch -D NAME
 old runs whenever you like (a run record is needed for `--merge` and
 `--session` on that branch, and the plan's ledger lives there until the
 branch is finished).
+
+A dispatch that fails before a session exists (the server will not start, or
+session-create is refused) now removes the branch and worktree it created,
+so recovery no longer needs `git worktree remove --force` by hand.
+`--session new --branch B` will also adopt a worktree that exists but has no
+run record, instead of refusing.
 
 ### Undoing a merge
 

@@ -10,7 +10,7 @@
       "name": "opencode-delegate",
       "source": "./plugins/opencode-delegate",
       "description": "oc-task / oc-models / oc-undo plus the opencode-driven-development skill: Claude writes the plan and briefs, opencode free models implement and review each task in a git worktree, merge with one revert point.",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "author": {
         "name": "Sighton-GH"
       },

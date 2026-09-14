@@ -1,6 +1,6 @@
 {
   "name": "opencode-delegate",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "opencode-driven development for Claude Code: Claude plans and writes briefs, opencode sessions on free models (Muse Spark 1.3 by default) implement and review each task in a git worktree; a mirror of subagent-driven-development with opencode in every seat.",
   "author": {
     "name": "Sighton-GH"

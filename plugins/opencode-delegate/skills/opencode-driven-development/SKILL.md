@@ -71,8 +71,9 @@ Three commands are on your PATH; `oc-task --help` has the exit codes.
 
 ```
 oc-task --brief PATH [--role implement|review] [--model M] [--branch B] [--session ID|new]
+        [--idle-timeout S] [--copy-untracked PATH]... [--no-link-node-modules]
 oc-task --branch-diff --branch B
-oc-task --merge --branch B --verified "COMMAND"
+oc-task --merge --branch B --verified "COMMAND" [-m MSG | --no-commit | --squash]
 oc-models --free [--verbose]
 oc-undo [--list]
 ```
@@ -117,18 +118,22 @@ the choice in the ledger.
    `.oc-worktrees/` to `.gitignore` on first run — create the directory
    yourself). Everything for this plan lives there: ledger, briefs, reports.
 3. Ledger: `.oc-runs/<plan-slug>/progress.md`, first line
-   `# ODD ledger — plan: <plan path> — branch: oc/<plan-slug>`. If it already
-   exists and names this plan, tasks with a `Task N: complete` line are DONE;
-   resume at the first task without one. A task whose last line is a fix
-   round is mid-loop — resume at the next round. Conversation memory does
-   not survive compaction; the ledger and `git log` do. Trust them over
-   recollection.
-4. Read the plan once. Create a todo per task. Scan for conflicts before
-   Task 1 — one row per pair of tasks sharing a file or interface, one row
-   per task for internal consistency — write the table to the ledger, rule
-   on anything it surfaces (`Ruling: <decision> — <why> — <cost if wrong>`),
-   and proceed.
-5. Sensitive-code check (see Posture). Ask now if any task qualifies.
+    `# ODD ledger — plan: <plan path> — branch: oc/<plan-slug>`. If it already
+    exists and names this plan, tasks with a `Task N: complete` line are DONE;
+    resume at the first task without one. A task whose last line is a fix
+    round is mid-loop — resume at the next round. Conversation memory does
+    not survive compaction; the ledger and `git log` do. Trust them over
+    recollection.
+ 4. If the task's inputs are untracked files the user just added, dispatch
+    Task 1 with `--copy-untracked <path>` for each, because the worktree
+    forks from `HEAD` and will not contain them otherwise; `node_modules`
+    is linked automatically.
+ 5. Read the plan once. Create a todo per task. Scan for conflicts before
+    Task 1 — one row per pair of tasks sharing a file or interface, one row
+    per task for internal consistency — write the table to the ledger, rule
+    on anything it surfaces (`Ruling: <decision> — <why> — <cost if wrong>`),
+    and proceed.
+ 6. Sensitive-code check (see Posture). Ask now if any task qualifies.
 
 ## The task loop
 
@@ -176,10 +181,14 @@ Read the summary's `## RESULT` block. Its `Status:` line is one of:
 Non-zero exits: **1** read the `errors:` lines (only then the `.log`), fix
 the cause, resume or re-dispatch. **3** (zero changes) with a DONE status is
 a brief problem — the model thought it was done; tighten and resume. **4**
-(image limit) the session is dead: write a continuation brief from the first
-incomplete numbered task and dispatch `--session new --branch B`; the
-checkpoint commits are kept. **5** (rate limit) stop and tell the user; do
-not retry on your own.
+(image limit or a poisoned reasoning state) the session is dead: write a
+continuation brief from the first incomplete numbered task and dispatch
+`--session new --branch B`; the checkpoint commits are kept. **5** (rate
+limit) stop and tell the user; do not retry on your own. **6** (stalled) the
+run produced no output for the idle timeout and was killed; the session is
+dead. Treat it exactly like 4: continuation brief from the first incomplete
+step, `--session new --branch B`. If the task legitimately has long silent
+stretches, re-dispatch with a larger `--idle-timeout`.
 
 ### 3. Review the task
 
@@ -192,8 +201,10 @@ Then write `.oc-runs/<plan-slug>/task-N-review-brief.md` from
 `${CLAUDE_PLUGIN_ROOT}/skills/opencode-driven-development/task-reviewer-brief.md`
 with: the brief path, the run's `.diff` path from the summary (the review
 package — commits, stat, full diff), and the plan's global constraints
-copied verbatim. Do not pre-judge findings ("don't flag X") and do not ask
-it to re-run tests. Dispatch:
+copied verbatim. **The `.diff` path must be absolute**, because reviewers
+execute inside `.oc-worktrees/<branch>` where `.oc-runs/` does not exist. Do
+not pre-judge findings ("don't flag X") and do not ask it to re-run tests.
+Dispatch:
 
 ```
 oc-task --brief .oc-runs/<plan-slug>/task-N-review-brief.md --role review --branch oc/<plan-slug> --session new
@@ -271,8 +282,11 @@ Merging is `oc-task --merge --branch oc/<plan-slug> --verified "<the
 verification command you re-ran on the final branch>"` — run that command
 first. `oc-task` refuses a dirty tree, a non-zero last implement run, files
 outside every brief's `# Files` section, or conflicts. It prints the sha;
-`oc-undo` reverts it. Never delete the worktree or branch yourself; the user
-does that.
+`oc-undo` reverts it. When the user wants to own the final commit — a
+specific message, or a squash — use `--merge -m "MSG"`, `--merge --no-commit`,
+or `--merge --squash`; the file audit runs either way, and a `--squash` commit
+is not a merge commit so `oc-undo` will not find it. Never delete the worktree
+or branch yourself; the user does that.
 
 ## Stops
 

@@ -100,7 +100,16 @@ Notes:
 - **Tasks** — the commit-per-step instruction is VERBATIM; checkpoints are
   what survive an image-limit death.
 - **Verification** — VERBATIM shape. You re-run this same command; make it
-  the real one.
+  the real one. Write greps against the artifact *as it actually is*, not as
+  you imagine it: a build step may rewrite what you are matching on (Hugo's
+  `--minify` strips attribute quotes, so `grep 'id="x"'` fails on correct
+  output and the implementer correctly reports BLOCKED). Check the real
+  output once yourself before putting a grep in a brief.
+- **node_modules in the worktree** — `oc-task` links the base checkout's
+  `node_modules` into a fresh worktree automatically. Because it is a symlink,
+  `npx <tool>` can fail with `Permission denied`; call the CLI entry point
+  directly instead — e.g. `node node_modules/@playwright/test/cli.js test` —
+  and put that exact form in the brief's Verification section.
 - **Required output** — VERBATIM. `oc-task` extracts the block; `Status:` is
   how you route the result.
 
