@@ -256,8 +256,18 @@ if [[ -n "$session" && "$session" != "new" ]]; then
 elif [[ "$session" == "new" ]]; then
   [[ -n "$branch" ]] || die "$EX_ERR" "--session new needs --branch <existing worktree branch>"
   rec=$(find_run ".branch == \"$branch\"") || true
-  [[ -n "$rec" ]] || die "$EX_ERR" "no run record in $RUNS_DIR for branch $branch"
-  base_branch=$(jq -r .base_branch "$rec"); base_sha=$(jq -r .base_sha "$rec")
+  if [[ -n "$rec" ]]; then
+    base_branch=$(jq -r .base_branch "$rec"); base_sha=$(jq -r .base_sha "$rec")
+  elif [[ -d "$wt_root/$branch" ]]; then
+    # A dispatch died before it could write a record (field report #2). The
+    # worktree and its checkpoint commits are still good, so recover the fork
+    # point from git rather than making the operator delete it by hand.
+    base_branch=$(git symbolic-ref --short HEAD 2>/dev/null) || die "$EX_ERR" "HEAD is detached; check out a branch first"
+    base_sha=$(git merge-base HEAD "$branch" 2>/dev/null) || base_sha=$(git rev-parse HEAD)
+    echo "oc-task: no run record for branch $branch; adopting the existing worktree (base $base_branch @ ${base_sha:0:7})" >&2
+  else
+    die "$EX_ERR" "no run record in $RUNS_DIR for branch $branch, and no worktree at $WORKTREES_DIR/$branch — dispatch without --session to start a fresh one"
+  fi
   session=""; reuse_wt=1
 else
   base_branch=$(git symbolic-ref --short HEAD 2>/dev/null) || die "$EX_ERR" "HEAD is detached; check out a branch first"
