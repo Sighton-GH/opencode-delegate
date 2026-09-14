@@ -162,7 +162,7 @@ provision_pathspec() {
 if [[ -n "${OC_TASK_SOURCE_ONLY:-}" ]]; then return 0 2>/dev/null || exit 0; fi
 
 # ---------------------------------------------------------------- arguments
-spec=""; model_arg=""; idle_arg=""; branch=""; session=""; do_merge=0; dry_run=0; verified=""; role="implement"; branch_diff=0; copy_untracked=(); link_nm=auto
+spec=""; model_arg=""; idle_arg=""; branch=""; session=""; do_merge=0; dry_run=0; verified=""; role="implement"; branch_diff=0; copy_untracked=(); link_nm=auto; merge_msg=""; no_commit=0; squash=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --brief|--spec) spec="${2:-}"; shift 2 ;;
@@ -178,6 +178,9 @@ while [[ $# -gt 0 ]]; do
     --copy-untracked) copy_untracked+=("${2:-}"); shift 2 ;;
     --link-node-modules)    link_nm=yes; shift ;;
     --no-link-node-modules) link_nm=no;  shift ;;
+    -m|--message) merge_msg="${2:-}"; shift 2 ;;
+    --no-commit)  no_commit=1; shift ;;
+    --squash)     squash=1; no_commit=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     *) usage >&2; die "$EX_ERR" "unknown argument: $1" ;;
   esac
