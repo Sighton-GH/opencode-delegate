@@ -311,6 +311,12 @@ eq "--merge -m succeeds" 0 "$STATUS"
 eq "the caller's subject is used" "feat: my own subject" "$(git -C "$FIX_REPO" log -1 --format=%s)"
 contains "the oc-task-run trailer survives for oc-undo" "oc-task-run:" "$(git -C "$FIX_REPO" log -1 --format=%B)"
 
+merge_fixture longmsg
+run_oc --merge --branch oc/longmsg --verified "true" --message "feat: the long form subject"
+eq "--merge --message succeeds" 0 "$STATUS"
+eq "the long-form subject is used" "feat: the long form subject" "$(git -C "$FIX_REPO" log -1 --format=%s)"
+contains "the oc-task-run trailer survives for oc-undo" "oc-task-run:" "$(git -C "$FIX_REPO" log -1 --format=%B)"
+
 merge_fixture nocommit
 run_oc --merge --branch oc/nocommit --verified "true" --no-commit
 eq "--merge --no-commit succeeds" 0 "$STATUS"
