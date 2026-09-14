@@ -70,9 +70,14 @@ fmt_duration() { local s=$1; printf '%dm%02ds' $((s/60)) $((s%60)); }
 # Extract the paths a spec's `# Files` section names. Any token containing `/`
 # or `.`, with quoting/punctuation stripped. Directories end in `/`; globs pass
 # through so `[[ path == token ]]` can match them.
+# Naming no files is a valid answer, not an error: a `--role review` brief has
+# no `# Files` section at all. Without the `|| true` the grep chain exits
+# non-zero for such a brief, and under `set -e` that aborts whatever loop the
+# caller is building its union in, silently truncating it.
 spec_file_tokens() {
   awk 'tolower($0) ~ /^#+[[:space:]]*files[[:space:]]*$/ {f=1; next} /^#+[[:space:]]/ {f=0} f' "$1" \
-    | grep -oE '[A-Za-z0-9_@./*?~-]+' | grep -E '[/.]' | sed -E 's/^[.]+$//; s/[.,;:]+$//' | grep -v '^$' | sort -u
+    | grep -oE '[A-Za-z0-9_@./*?~-]+' | grep -E '[/.]' | sed -E 's/^[.]+$//; s/[.,;:]+$//' | grep -v '^$' | sort -u \
+    || true
 }
 
 check_spec() { # prints missing sections, one per line; returns 0 if none
@@ -305,7 +310,12 @@ if [[ $do_merge -eq 1 ]]; then
   git show-ref --verify --quiet "refs/heads/$branch" || refuse "branch '$branch' no longer exists"
   mapfile -t tokens < <(
     for f in "$runs_dir"/*.json; do jq -r "select(.branch == \"$branch\") | .spec" "$f"; done 2>/dev/null \
-      | sort -u | while read -r sp; do [[ -f "$sp" ]] && spec_file_tokens "$sp"; done | sort -u)
+      | sort -u | while read -r sp; do
+          # `continue` rather than `&&`: one unreadable or file-less spec must
+          # not end the loop, or the union silently stops at that brief.
+          [[ -f "$sp" ]] || continue
+          spec_file_tokens "$sp"
+        done | sort -u)
   [[ ${#tokens[@]} -gt 0 ]] || refuse "no spec for branch '$branch' names any path in its # Files section (looked at $rspec)"
   outside=()
   while IFS= read -r p; do

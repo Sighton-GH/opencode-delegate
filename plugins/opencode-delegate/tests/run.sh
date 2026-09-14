@@ -393,6 +393,18 @@ run_oc --merge --branch oc/unionspecs --verified "true"
 eq "a review brief between two implement briefs does not truncate the audit" 0 "$STATUS"
 lacks "and stub-output.txt is not reported as unlisted" "not listed in the spec" "$OUT"
 
+# The union above must not have become a blanket pass: a file that no brief on
+# the branch names is still refused. This is the refusal the widened union
+# could most easily have weakened.
+new_fixture uncovered
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+sed -i 's|`stub-output.txt`|`placeholder.txt`|' "$brief"
+run_oc --brief "$brief" --branch oc/uncovered
+eq "[uncovered] setup dispatch succeeded" 0 "$STATUS"
+run_oc --merge --branch oc/uncovered --verified "true"
+neq "a file no brief names is still refused" 0 "$STATUS"
+contains "and the refusal names the file" "stub-output.txt" "$OUT"
+
 section "the new flags are merge-only"
 new_fixture mergeonly
 brief="$FIX_ROOT/brief.md"; write_brief "$brief"
