@@ -73,6 +73,13 @@ check_spec() { # prints missing sections, one per line; returns 0 if none
   return $missing
 }
 
+# URL-encode a value for use in a query string. The worktree path routinely
+# contains a space ("/Users/me/VS Code/repo"), which makes an unencoded query
+# string invalid: opencode then returns no session id and the failure reads
+# like an auth problem rather than a quoting one (field report #1). jq is
+# already a hard dependency, so this costs nothing.
+uri_escape() { jq -rn --arg s "${1-}" '$s|@uri'; }
+
 # Test hook. `OC_TASK_SOURCE_ONLY=1 . oc-task` defines the helpers above and
 # returns before any argument parsing, dependency check, or repo lookup, so the
 # test suite can exercise them directly. `return` fails outside a sourced file,
