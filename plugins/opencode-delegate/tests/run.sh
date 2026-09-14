@@ -355,6 +355,44 @@ neq "--merge with no .oc-runs directory is refused" 0 "$STATUS"
 contains "it gives the tool's own refusal, not a bash error" "merge refused" "$OUT"
 contains "it names the missing run record" "no implement run record" "$OUT"
 
+section "the merge audit unions every brief on the branch"
+# The audit reads each run's spec in `sort -u` order over spec paths, so the
+# brief filenames below are chosen deliberately: `a-brief.md` sorts first,
+# the review brief `m-review-brief.md` sorts between, and `z-brief.md` — the
+# only brief naming the file the stub actually writes — sorts last. A review
+# brief has no `# Files` section at all, so if one can abort the union the
+# audit never reaches `z-brief.md` and refuses a merge every brief covers.
+new_fixture unionspecs
+a_brief="$FIX_ROOT/a-brief.md"; write_brief "$a_brief"
+# Name a file the branch never touches, so this brief alone cannot cover it.
+sed -i 's|`stub-output.txt`|`placeholder.txt`|' "$a_brief"
+run_oc --brief "$a_brief" --branch oc/unionspecs
+eq "[unionspecs] first implement dispatch succeeded" 0 "$STATUS"
+
+r_brief="$FIX_ROOT/m-review-brief.md"
+cat >"$r_brief" <<'RB'
+# Objective
+Stub review.
+
+# Diff under review
+Nothing.
+
+# Required output
+End your final message with a block in exactly this form:
+## RESULT
+Status: DONE
+RB
+run_oc --brief "$r_brief" --role review --branch oc/unionspecs --session new
+eq "[unionspecs] the review dispatch succeeded" 0 "$STATUS"
+
+z_brief="$FIX_ROOT/z-brief.md"; write_brief "$z_brief"
+run_oc --brief "$z_brief" --branch oc/unionspecs --session new
+eq "[unionspecs] second implement dispatch succeeded" 0 "$STATUS"
+
+run_oc --merge --branch oc/unionspecs --verified "true"
+eq "a review brief between two implement briefs does not truncate the audit" 0 "$STATUS"
+lacks "and stub-output.txt is not reported as unlisted" "not listed in the spec" "$OUT"
+
 section "the new flags are merge-only"
 new_fixture mergeonly
 brief="$FIX_ROOT/brief.md"; write_brief "$brief"
