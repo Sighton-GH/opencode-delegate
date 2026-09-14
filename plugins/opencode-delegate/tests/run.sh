@@ -284,4 +284,60 @@ rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
 sha="$(jq -r .head_sha "$rec")"
 eq "the operator's git config survives the dispatch" 12 "${#sha}"
 
+section "merge modes (finding #10)"
+# Each fixture gets its own branch that is ready to merge: the stub's default
+# `ok` mode writes and commits stub-output.txt, which write_brief's # Files
+# section names, so the audit passes.
+merge_fixture() { # $1 = label, also the branch suffix
+  new_fixture "$1"
+  brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+  run_oc --brief "$brief" --branch "oc/$1"
+  eq "[$1] setup dispatch succeeded" 0 "$STATUS"
+}
+
+merge_fixture custommsg
+run_oc --merge --branch oc/custommsg --verified "true" -m "feat: my own subject"
+eq "--merge -m succeeds" 0 "$STATUS"
+eq "the caller's subject is used" "feat: my own subject" "$(git -C "$FIX_REPO" log -1 --format=%s)"
+contains "the oc-task-run trailer survives for oc-undo" "oc-task-run:" "$(git -C "$FIX_REPO" log -1 --format=%B)"
+
+merge_fixture nocommit
+run_oc --merge --branch oc/nocommit --verified "true" --no-commit
+eq "--merge --no-commit succeeds" 0 "$STATUS"
+eq "it did not commit" "seed" "$(git -C "$FIX_REPO" log -1 --format=%s)"
+contains "the change is staged for the caller" "stub-output.txt" "$(git -C "$FIX_REPO" diff --cached --name-only)"
+contains "the summary tells the caller to commit" "commit" "$OUT"
+
+merge_fixture squash
+run_oc --merge --branch oc/squash --verified "true" --squash
+eq "--merge --squash succeeds" 0 "$STATUS"
+eq "it did not commit either" "seed" "$(git -C "$FIX_REPO" log -1 --format=%s)"
+contains "the squashed change is staged" "stub-output.txt" "$(git -C "$FIX_REPO" diff --cached --name-only)"
+
+merge_fixture plainmerge
+run_oc --merge --branch oc/plainmerge --verified "true"
+eq "a plain --merge still succeeds" 0 "$STATUS"
+contains "and still reports the undo command" "oc-undo" "$OUT"
+eq "and it is still a merge commit (two parents)" "2" \
+  "$(git -C "$FIX_REPO" log -1 --format=%P | wc -w)"
+
+section "merge refusals still hold (no regression)"
+merge_fixture refusals
+run_oc --merge --branch oc/refusals --no-commit
+neq "--merge without --verified is refused" 0 "$STATUS"
+contains "and says why" "verified" "$OUT"
+printf 'dirt\n' >"$FIX_REPO/dirt.txt"
+git -C "$FIX_REPO" add dirt.txt
+run_oc --merge --branch oc/refusals --verified "true" --no-commit
+neq "a dirty tree is still refused" 0 "$STATUS"
+contains "and says why" "dirty" "$OUT"
+git -C "$FIX_REPO" reset -q --hard
+
+section "the new flags are merge-only"
+new_fixture mergeonly
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+run_oc --brief "$brief" --branch oc/mo --no-commit --dry-run
+neq "--no-commit outside --merge is refused" 0 "$STATUS"
+contains "and says so" "--merge" "$OUT"
+
 summary
