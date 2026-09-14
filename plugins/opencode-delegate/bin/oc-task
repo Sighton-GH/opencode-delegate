@@ -322,7 +322,7 @@ for attempt in 1 2 3 4 5; do
   fi
   kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true; serve_pid=""
 done
-[[ -n "$url" ]] || die "$EX_ERR" "could not start opencode serve (last attempt on port $port):"$'\n'"$(tail -5 "$serve_log")"
+[[ -n "$url" ]] || die_fresh "$EX_ERR" "could not start opencode serve (last attempt on port $port):"$'\n'"$(tail -5 "$serve_log")"$'\n'"the branch and worktree this run created were removed; fix the cause and dispatch again."
 
 # Permissions are auto-approved for this session ONLY because the model is
 # confined to a throwaway git worktree: the base branch is untouched, every
@@ -333,7 +333,7 @@ if [[ $resume -eq 0 ]]; then
       -H 'Content-Type: application/json' \
       -d "$(jq -cn --arg t "oc-task $run_id" '{title:$t, permission:[{permission:"*",pattern:"*",action:"allow"}]}')" \
     | jq -r '.id // empty') || true
-  [[ "$session" == ses_* ]] || die "$EX_ERR" "opencode did not return a session id"
+  [[ "$session" == ses_* ]] || die_fresh "$EX_ERR" "opencode did not return a session id (is opencode authenticated? does '$url' answer?). The branch and worktree this run created were removed; fix the cause and dispatch again."
 fi
 
 # ---------------------------------------------------------------- dispatch
