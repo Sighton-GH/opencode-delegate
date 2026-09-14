@@ -186,6 +186,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# These only mean anything when there is a merge to shape. Refusing here is
+# kinder than silently ignoring a flag someone believed was doing something.
+if [[ $do_merge -eq 0 ]]; then
+  [[ -z "$merge_msg" && $no_commit -eq 0 && $squash -eq 0 ]] \
+    || die "$EX_ERR" "-m, --no-commit and --squash only apply to --merge"
+fi
+
 case "$role" in implement|review) ;; *) die "$EX_ERR" "--role must be implement or review, got: $role" ;; esac
 if [[ $role == review ]]; then REQUIRED_SECTIONS=("${REVIEW_SECTIONS[@]}"); else REQUIRED_SECTIONS=("${IMPLEMENT_SECTIONS[@]}"); fi
 
