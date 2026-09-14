@@ -190,6 +190,29 @@ eq "a second run in the same worktree succeeds" 0 "$STATUS"
 tracked=$(git -C "$wt" log --name-only --pretty=format: | sort -u | grep -E '^(inputs|node_modules)' || true)
 eq "and still commits nothing provisioned" "" "$tracked"
 
+printf 'reviewer scratch\n' >"$wt/reviewer-scratch.txt"
+cat >"$FIX_ROOT/review.md" <<'BRIEF'
+# Objective
+Review it.
+
+# Diff under review
+stub-output.txt
+
+# Required output
+End your final message with a block in exactly this form:
+## RESULT
+Status: DONE
+BRIEF
+OC_STUB_RUN_MODE=nochange run_oc --brief "$FIX_ROOT/review.md" --role review --branch oc/prov --session new
+eq "a review run in a provisioned worktree succeeds" 0 "$STATUS"
+contains "the review run says it discarded changes" "changes discarded" "$OUT"
+[[ -e "$wt/reviewer-scratch.txt" ]] \
+  && no "the review run discards the reviewer's stray file" "absent" "present" \
+  || ok "the review run discards the reviewer's stray file"
+eq "the review run keeps the provisioned input" "untracked input" "$(cat "$wt/inputs/raw.md" 2>/dev/null)"
+[[ -L "$wt/node_modules" ]] && ok "the review run keeps the node_modules link" \
+  || no "the review run keeps the node_modules link" "a symlink" "$(ls -ld "$wt/node_modules" 2>&1)"
+
 new_fixture noprovision
 brief="$FIX_ROOT/brief.md"; write_brief "$brief"
 mkdir -p "$FIX_REPO/node_modules"
