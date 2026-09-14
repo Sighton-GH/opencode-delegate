@@ -185,6 +185,22 @@ rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
 contains "the record lists what was provisioned" "inputs" "$(jq -c .provisioned "$rec")"
 contains "including node_modules" "node_modules" "$(jq -c .provisioned "$rec")"
 
+excl_file="$(git -C "$wt" rev-parse --git-dir)/oc-provisioned.excludes"
+grep -qxF "/inputs" "$excl_file" \
+  && ok "the excludes entry for inputs is root-anchored" \
+  || no "the excludes entry for inputs is root-anchored" "/inputs" "$(cat "$excl_file" 2>/dev/null)"
+grep -qxF "inputs" "$excl_file" \
+  && no "no bare basename pattern remains" "absent" "present" \
+  || ok "no bare basename pattern remains"
+mkdir -p "$wt/src/inputs"
+printf 'nested\n' >"$wt/src/inputs/x"
+( cd "$wt" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.excludesFile GIT_CONFIG_VALUE_0="$excl_file" git check-ignore -q src/inputs/x ) \
+  && no "a nested same-named path is not ignored" "not ignored" "ignored" \
+  || ok "a nested same-named path is not ignored"
+( cd "$wt" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.excludesFile GIT_CONFIG_VALUE_0="$excl_file" git check-ignore -q inputs/raw.md ) \
+  && ok "the provisioned path itself is ignored" \
+  || no "the provisioned path itself is ignored" "ignored" "not ignored"
+
 run_oc --brief "$brief" --branch oc/prov --session new
 eq "a second run in the same worktree succeeds" 0 "$STATUS"
 tracked=$(git -C "$wt" log --name-only --pretty=format: | sort -u | grep -E '^(inputs|node_modules)' || true)
@@ -255,5 +271,17 @@ neq "a --copy-untracked path with .. is refused" 0 "$STATUS"
 [[ -e "$FIX_REPO/.oc-worktrees/oc/dotdot" ]] \
   && no "refusing a .. path creates no worktree" "absent" "present" \
   || ok "refusing a .. path creates no worktree"
+
+new_fixture envcount
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+mkdir -p "$FIX_REPO/inputs"
+printf 'untracked input\n' >"$FIX_REPO/inputs/raw.md"
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.abbrev GIT_CONFIG_VALUE_0=12 run_oc --brief "$brief" --branch oc/env --copy-untracked inputs
+eq "a dispatch with a preset GIT_CONFIG_COUNT succeeds" 0 "$STATUS"
+eq "the provisioned input lands despite the preset env" "untracked input" \
+  "$(cat "$FIX_REPO/.oc-worktrees/oc/env/inputs/raw.md" 2>/dev/null)"
+rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
+sha="$(jq -r .head_sha "$rec")"
+eq "the operator's git config survives the dispatch" 12 "${#sha}"
 
 summary

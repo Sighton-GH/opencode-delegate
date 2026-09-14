@@ -443,9 +443,17 @@ if [[ -n "$prov_list" && -s "$prov_list" ]]; then
         if [[ -f "$g" ]]; then cat "$g" >> "$prov_excl" || true; break; fi
       done
     fi
-    cat "$prov_list" >> "$prov_excl" || true
+    # Anchor our entries to the worktree root: a bare basename pattern would
+    # match at any depth and silently drop a legitimately created nested path
+    # (e.g. `src/inputs/`) from every commit. The operator's own patterns
+    # above keep their original meaning.
+    sed '/^$/d; s|^|/|' "$prov_list" >> "$prov_excl" || true
   fi
-  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.excludesFile GIT_CONFIG_VALUE_0="$prov_excl"
+  # Append to, rather than replace, any GIT_CONFIG_COUNT the operator already
+  # exported, so their configuration survives this process tree.
+  n="${GIT_CONFIG_COUNT:-0}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  export "GIT_CONFIG_KEY_$n=core.excludesFile" "GIT_CONFIG_VALUE_$n=$prov_excl" GIT_CONFIG_COUNT=$((n + 1))
 fi
 
 # ---------------------------------------------------------------- opencode server
