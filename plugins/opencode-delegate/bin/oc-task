@@ -80,6 +80,28 @@ check_spec() { # prints missing sections, one per line; returns 0 if none
 # already a hard dependency, so this costs nothing.
 uri_escape() { jq -rn --arg s "${1-}" '$s|@uri'; }
 
+# A dispatch that dies after the worktree exists but before a run record is
+# written leaves a branch and a worktree that every recovery path then refuses
+# — there is no record to resume from, and a fresh dispatch refuses because the
+# worktree exists (field report #2). Undo exactly what this invocation created
+# so the operator can simply dispatch again.
+discard_new_worktree() {
+  [[ "${created_wt:-0}" -eq 1 ]] || return 0
+  created_wt=0
+  if [[ -n "${serve_pid:-}" ]]; then
+    kill "$serve_pid" 2>/dev/null || true
+    wait "$serve_pid" 2>/dev/null || true
+    serve_pid=""
+  fi
+  git worktree remove --force "$worktree" >/dev/null 2>&1 || rm -rf "$worktree"
+  git worktree prune >/dev/null 2>&1 || true
+  git branch -D "$branch" >/dev/null 2>&1 || true
+  return 0
+}
+
+# die(), but first undo a worktree this invocation created.
+die_fresh() { discard_new_worktree; die "$@"; }
+
 # Test hook. `OC_TASK_SOURCE_ONLY=1 . oc-task` defines the helpers above and
 # returns before any argument parsing, dependency check, or repo lookup, so the
 # test suite can exercise them directly. `return` fails outside a sourced file,
