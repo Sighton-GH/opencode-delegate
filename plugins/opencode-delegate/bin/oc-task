@@ -303,7 +303,7 @@ done
 # change is a diff you review before merging, and oc-undo reverts a merge in
 # one command. Do not loosen this into running against the main checkout.
 if [[ $resume -eq 0 ]]; then
-  session=$(curl -sf -m 15 -X POST "$url/session?directory=$worktree" \
+  session=$(curl -sf -m 15 -X POST "$url/session?directory=$(uri_escape "$worktree")" \
       -H 'Content-Type: application/json' \
       -d "$(jq -cn --arg t "oc-task $run_id" '{title:$t, permission:[{permission:"*",pattern:"*",action:"allow"}]}')" \
     | jq -r '.id // empty') || true
