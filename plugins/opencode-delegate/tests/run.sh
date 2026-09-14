@@ -23,6 +23,16 @@ for f in oc-task oc-models oc-undo; do
   eq "bash -n $f is clean" "" "$out"
 done
 
+section "the suite is hermetic"
+# A stub that cannot be executed sends bash on to the user's real opencode and
+# the whole suite then measures the wrong binary, while still passing. Prove
+# the stub is the one answering before trusting anything below.
+new_fixture hermetic
+resolved=$(cd "$FIX_REPO" && PATH="$FIX_BIN:$PATH" command -v opencode)
+eq "opencode resolves to the fixture's stub" "$FIX_BIN/opencode" "$resolved"
+models=$(cd "$FIX_REPO" && PATH="$FIX_BIN:$PATH" opencode models </dev/null 2>&1)
+contains "the stub answers \`models\`" "opencode/stub-alternate-free" "$models"
+
 section "helpers"
 # Sourcing oc-task turns on `set -euo pipefail` in this shell; turn it back off
 # immediately or the first failing assertion would abort the suite.
