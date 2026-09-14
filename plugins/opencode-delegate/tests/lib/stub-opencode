@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Fake `opencode` for the oc-task test suite. Real opencode is never invoked:
+# this covers the three subcommands oc-task calls, with behaviour chosen by
+# environment variables so one stub serves every scenario.
+#
+#   OC_STUB_STATE            dir this stub records observations into (required)
+#   OC_STUB_SESSION_STATUS   HTTP status for POST /session (default 200)
+#   OC_STUB_RUN_MODE         what `opencode run` does (default: ok)
+#       ok        write a short event stream with a DONE RESULT block, create a
+#                 file in the worktree and commit it
+#       nochange  write the same event stream but touch nothing
+#       stall     write nothing at all and sleep until killed
+#       poison    emit the provider's encrypted_content error
+#       fail      emit a generic error event and exit 1
+#       ratelimit emit a 429 error event and exit 1
+#   OC_STUB_RUN_SLEEP        seconds `run` sleeps before acting (default 0)
+set -uo pipefail
+
+state="${OC_STUB_STATE:?stub needs OC_STUB_STATE}"
+mkdir -p "$state"
+
+# `opencode run` reads its prompt from stdin. Drain it so the caller's
+# redirection behaves the way it does against the real binary.
+drain_stdin() { cat >"$state/last-prompt" 2>/dev/null || true; }
+
+emit() { printf '%s\n' "$1"; }
+
+case "${1:-}" in
+  models)
+    # oc-task greps this for an exact match on the configured model id.
+    emit 'opencode/muse-spark-1.3-contributor-free'
+    emit 'opencode/stub-alternate-free'
+    exit 0
+    ;;
+
+  serve)
+    port=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in --port) port="${2:-}"; shift 2 ;; *) shift ;; esac
+    done
+    exec python3 "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/stub-server.py" "$port"
+    ;;
+
+  run)
+    drain_stdin
+    printf '%s\n' "$*" >"$state/run-args"
+    dir="$PWD"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in --dir) dir="${2:-}"; shift 2 ;; *) shift ;; esac
+    done
+    sleep "${OC_STUB_RUN_SLEEP:-0}"
+    case "${OC_STUB_RUN_MODE:-ok}" in
+      stall)
+        # The process is alive, the log never grows, no error is ever emitted.
+        sleep 3600
+        exit 0
+        ;;
+      poison)
+        emit '{"type":"error","error":{"name":"APIError","data":{"message":"Error from provider (Console): Upstream request failed: [invalid_request_error] reasoning `encrypted_content` was not issued to this caller"}}}'
+        exit 1
+        ;;
+      ratelimit)
+        emit '{"type":"error","error":{"name":"APIError","data":{"message":"429 Too Many Requests: rate limit exceeded"}}}'
+        exit 1
+        ;;
+      fail)
+        emit '{"type":"error","error":{"name":"APIError","data":{"message":"stub failure"}}}'
+        exit 1
+        ;;
+      nochange)
+        emit '{"type":"text","part":{"text":"## RESULT\nStatus: DONE\nFiles changed: none\n"}}'
+        exit 0
+        ;;
+      ok|*)
+        printf 'stub wrote this\n' >>"$dir/stub-output.txt"
+        git -C "$dir" add -A >/dev/null 2>&1 || true
+        git -C "$dir" -c user.name=stub -c user.email=stub@localhost \
+            commit -q -m "stub: implement the brief" >/dev/null 2>&1 || true
+        emit '{"type":"text","part":{"text":"## RESULT\nStatus: DONE\nFiles changed: stub-output.txt\nCommits: stub\nCommands run and their outcome: none\nCould not complete: nothing\nAssumptions made: none\nConcerns or questions: none\n"}}'
+        exit 0
+        ;;
+    esac
+    ;;
+
+  *)
+    emit "stub-opencode: unsupported subcommand: ${1:-<none>}" >&2
+    exit 127
+    ;;
+esac
