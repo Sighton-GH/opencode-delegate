@@ -641,7 +641,8 @@ fi
 # The `|| true` keeps `set -euo pipefail` from exiting when the provision file
 # does not exist yet: the missing-file test on the left then fails the whole
 # pipeline even though jq still prints `[]` for the empty input.
-provisioned_json=$( { [[ -f "$(provision_file)" ]] && cat "$(provision_file)"; } 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))' || true )
+prov_file=$(provision_file)
+provisioned_json=$( { [[ -f "$prov_file" ]] && cat "$prov_file"; } 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))' || true )
 [[ -n "$provisioned_json" ]] || provisioned_json='[]'
 
 jq -n --arg run_id "$run_id" --arg branch "$branch" --arg worktree "$worktree" \
