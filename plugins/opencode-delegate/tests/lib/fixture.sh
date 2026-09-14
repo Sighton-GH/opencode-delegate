@@ -16,7 +16,18 @@ new_fixture() { # $1 = optional label
   FIX_STUB_STATE="$FIX_ROOT/stub-state"
   mkdir -p "$FIX_REPO" "$FIX_BIN" "$FIX_STUB_STATE"
 
-  ln -sf "$TESTS_DIR/lib/stub-opencode" "$FIX_BIN/opencode"
+  # The repo may sit on a mount with core.filemode=false, where a checked-out
+  # file never gets its executable bit even though git records 100755. A
+  # non-executable stub is worse than a missing one: bash's PATH search skips
+  # an EACCES hit and silently falls through to the user's real opencode, so
+  # the suite would pass while testing the wrong binary. $FIX_BIN is under
+  # /tmp, which does honour modes, so generate a shim there and invoke the
+  # stub through `bash` explicitly.
+  cat >"$FIX_BIN/opencode" <<SHIM
+#!/usr/bin/env bash
+exec bash "$TESTS_DIR/lib/stub-opencode" "\$@"
+SHIM
+  chmod +x "$FIX_BIN/opencode"
 
   git -C "$FIX_REPO" init -q
   git -C "$FIX_REPO" config user.email oc-test@localhost
