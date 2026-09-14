@@ -252,8 +252,8 @@ and prints the summary. Files:
 Worktree rules: the first run on a branch creates `.oc-worktrees/NAME` off
 current HEAD. `--session ID` resumes that session in its worktree.
 `--session new --branch NAME` starts a fresh session in the existing
-worktree (every task after the first; continuation after an image-limit
-death). Anything else with an existing worktree is refused.
+worktree (every task after the first; continuation after a dead
+session). Anything else with an existing worktree is refused.
 
 `--role review` runs opencode's built-in read-only `plan` agent: it can read,
 grep, and run commands, but every edit is denied. Required brief sections
