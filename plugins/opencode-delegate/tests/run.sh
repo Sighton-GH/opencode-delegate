@@ -123,4 +123,43 @@ run_oc --brief "$brief" --branch oc/ghost --session new --dry-run
 neq "--session new still refuses when there is neither record nor worktree" 0 "$STATUS"
 contains "and says so plainly" "no worktree" "$OUT"
 
+section "idle watchdog (finding #4)"
+new_fixture stall
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+started=$(date +%s)
+OC_STUB_RUN_MODE=stall run_oc --brief "$brief" --branch oc/stall --idle-timeout 3
+elapsed=$(( $(date +%s) - started ))
+eq "a stalled run exits 6" 6 "$STATUS"
+contains "the summary says it stalled" "stalled" "$OUT"
+contains "it tells the operator to re-dispatch" "--session new" "$OUT"
+[[ $elapsed -lt 60 ]] && ok "the watchdog fired instead of hanging (${elapsed}s)" \
+  || no "the watchdog fired instead of hanging" "<60s" "${elapsed}s"
+rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
+eq "the run record marks the session dead" "true" "$(jq -r .dead "$rec")"
+eq "the record names the reason" "stalled" "$(jq -r .dead_reason "$rec")"
+
+section "poisoned session (finding #3)"
+new_fixture poison
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=poison run_oc --brief "$brief" --branch oc/poison
+eq "an encrypted_content failure exits 4, not 1" 4 "$STATUS"
+contains "the summary explains the session is unrecoverable" "not resumable" "$OUT"
+contains "it tells the operator to re-dispatch" "--session new" "$OUT"
+rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
+eq "the poisoned session is recorded dead" "true" "$(jq -r .dead "$rec")"
+eq "with its own reason" "encrypted-content" "$(jq -r .dead_reason "$rec")"
+run_oc --brief "$brief" --session ses_stub0000000000000000
+eq "resuming a dead session is refused" 4 "$STATUS"
+contains "the refusal names the reason" "encrypted-content" "$OUT"
+
+section "rate limiting still classifies as 5 (no regression)"
+new_fixture ratelimit
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=ratelimit run_oc --brief "$brief" --branch oc/rl
+eq "a 429 still exits 5" 5 "$STATUS"
+
+section "process group cleanup (finding #8)"
+contains "the run is started as its own process group" 'set -m' "$(cat "$OC_TASK")"
+contains "cleanup kills the run, not just the server" "kill_run" "$(cat "$OC_TASK")"
+
 summary
