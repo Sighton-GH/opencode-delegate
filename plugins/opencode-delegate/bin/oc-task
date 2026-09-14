@@ -184,14 +184,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$role" in implement|review) ;; *) die "$EX_ERR" "--role must be implement or review, got: $role" ;; esac
-# Fail before anything is created: a typo'd input path is much cheaper to
-# report now than after a worktree exists. Note `${arr[@]:-}` on an empty array
-# yields one empty element under `set -u`, so skip empties rather than treating
-# one as a missing argument.
-for p in "${copy_untracked[@]:-}"; do
-  [[ -n "$p" ]] || continue
-  [[ -e "$p" ]] || die "$EX_ERR" "--copy-untracked: no such path in the base checkout: $p"
-done
 if [[ $role == review ]]; then REQUIRED_SECTIONS=("${REVIEW_SECTIONS[@]}"); else REQUIRED_SECTIONS=("${IMPLEMENT_SECTIONS[@]}"); fi
 
 for dep in git opencode jq curl; do
@@ -233,6 +225,20 @@ fi
 # ---------------------------------------------------------------- repo
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || die "$EX_ERR" "not inside a git repository"
 cd "$repo_root"
+# Validate --copy-untracked here and not during argument parsing: the check
+# must test the same `$repo_root/$rel` the copy step reads, while the
+# operator's invocation cwd may be a subdirectory of the repo. Absolute
+# paths and `..` components are refused outright so a value can never escape
+# the repository root. Failing now is far cheaper than stranding a worktree
+# later. Note `${arr[@]:-}` on an empty array yields one empty element under
+# `set -u`, so skip empties rather than treating one as a missing argument.
+for p in "${copy_untracked[@]:-}"; do
+  [[ -n "$p" ]] || continue
+  [[ "$p" != /* && "$p" != *".."* ]] || die "$EX_ERR" "--copy-untracked: paths are relative to the repository root, got: $p"
+  rel="${p#./}"; rel="${rel%/}"
+  [[ -n "$rel" && "$rel" != "." ]] || die "$EX_ERR" "--copy-untracked: paths are relative to the repository root, got: $p"
+  [[ -e "$repo_root/$rel" ]] || die "$EX_ERR" "--copy-untracked: no such path in the base checkout: $p"
+done
 runs_dir="$repo_root/$RUNS_DIR"
 wt_root="$repo_root/$WORKTREES_DIR"
 
@@ -392,7 +398,9 @@ else
     [[ -n "$p" ]] || continue
     rel="${p#./}"; rel="${rel%/}"
     mkdir -p "$worktree/$(dirname "$rel")"
-    cp -a "$repo_root/$rel" "$worktree/$rel"
+    # A copy failure must tear down the worktree this run created rather
+    # than stranding a branch and worktree with nothing recorded for them.
+    cp -a "$repo_root/$rel" "$worktree/$rel" || die_fresh "$EX_ERR" "--copy-untracked: could not copy $rel into the worktree"
     provision_add "$rel"
     echo "oc-task: copied untracked $rel into the worktree" >&2
   done

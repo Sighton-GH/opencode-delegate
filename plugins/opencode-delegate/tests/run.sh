@@ -211,4 +211,26 @@ eq "a dispatch with no provisioning flags still works" 0 "$STATUS"
 rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
 eq "and records an empty provisioned list" "[]" "$(jq -c .provisioned "$rec")"
 
+new_fixture subdir
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+mkdir -p "$FIX_REPO/inputs" "$FIX_REPO/sub"
+printf 'untracked input\n' >"$FIX_REPO/inputs/raw.md"
+sub_out=$(cd "$FIX_REPO/sub" && PATH="$FIX_BIN:$PATH" bash "$OC_TASK" --brief "$brief" --branch oc/sub --copy-untracked inputs 2>&1)
+sub_status=$?
+eq "a dispatch from a repo subdirectory succeeds" 0 "$sub_status"
+contains "it reports the copy" "copied untracked inputs" "$sub_out"
+eq "the input still lands in the worktree" "untracked input" "$(cat "$FIX_REPO/.oc-worktrees/oc/sub/inputs/raw.md" 2>/dev/null)"
+
+run_oc --brief "$brief" --branch oc/abs --copy-untracked /etc/passwd
+neq "an absolute --copy-untracked path is refused" 0 "$STATUS"
+[[ -e "$FIX_REPO/.oc-worktrees/oc/abs" ]] \
+  && no "refusing an absolute path creates no worktree" "absent" "present" \
+  || ok "refusing an absolute path creates no worktree"
+
+run_oc --brief "$brief" --branch oc/dotdot --copy-untracked ../x
+neq "a --copy-untracked path with .. is refused" 0 "$STATUS"
+[[ -e "$FIX_REPO/.oc-worktrees/oc/dotdot" ]] \
+  && no "refusing a .. path creates no worktree" "absent" "present" \
+  || ok "refusing a .. path creates no worktree"
+
 summary
