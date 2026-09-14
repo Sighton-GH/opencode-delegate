@@ -44,8 +44,10 @@ refuses any id not in the live catalog.
 ## Exit codes (`oc-task`)
 
 0 success · 1 opencode/setup error · 2 brief rejected · 3 zero changes
-(implement) · 4 image limit (session dead, never retried) · 5 rate limited.
-Non-zero exits leave the worktree in place.
+(implement) · 4 session unrecoverable — image limit or a poisoned reasoning
+state (never retried) · 5 rate limited · 6 stalled (no output for the idle
+timeout; session dead). Non-zero exits leave the worktree in place, except a
+dispatch that fails before a session exists, which removes what it created.
 
 ## Safety model
 
