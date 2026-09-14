@@ -328,6 +328,25 @@ in the `# Files` section of some brief dispatched to that branch; and there
 are no conflicts. The commit carries `oc-task-run:`, `model:`, `spec:`,
 `branch:`, `session:`, `verified:` trailers. The branch is never deleted.
 
+The three merge modes exist because the six refusals above are a
+genuine audit: before v0.4.0 a caller who needed a particular commit
+message or a squash had to integrate by hand and lost the audit
+entirely. All three run every refusal first, unchanged and in the
+same order; only the commit step differs.
+
+`-m MESSAGE` (`--message`) uses your subject instead of the generated
+`oc-task merge: BRANCH`. The `oc-task-run:` trailer is still written,
+so `oc-undo` still finds the merge. `--no-commit` runs every check,
+merges into the index and working tree, and stops without committing.
+The prepared message — subject and all trailers — is written to
+`.git/OC_TASK_MERGE_MSG`, so `git commit -F .git/OC_TASK_MERGE_MSG`
+reproduces exactly what the default path would have committed. A
+conflict still aborts the merge and refuses, leaving the tree as it
+was. `--squash` stages the branch's net change as an ordinary change
+set rather than a merge. It implies `--no-commit`. A squashed commit
+is not a merge commit, and `oc-undo` searches `git log --merges`, so
+it will not find one: it is the one way to lose the undo path.
+
 ### `oc-models`
 
 ```
