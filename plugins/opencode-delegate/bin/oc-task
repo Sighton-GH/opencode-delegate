@@ -268,6 +268,9 @@ else
   fi
 fi
 worktree="$wt_root/$branch"
+# Set to 1 only when this invocation created the worktree, so the teardown can
+# never remove one the caller already had.
+created_wt=0
 run_id="$(date +%Y%m%dT%H%M%S)-$(tr '/' '_' <<<"$branch")"
 log="$runs_dir/$run_id.log"; diff_out="$runs_dir/$run_id.diff"; rec_out="$runs_dir/$run_id.json"
 
@@ -294,6 +297,7 @@ else
   [[ ! -e "$worktree" ]] || die "$EX_ERR" "worktree $WORKTREES_DIR/$branch already exists. Pass --session <id> to resume it, --session new to reuse it, or choose another --branch"
   ! git show-ref --verify --quiet "refs/heads/$branch" || die "$EX_ERR" "branch '$branch' already exists; choose another --branch"
   git worktree add -q -b "$branch" "$worktree" HEAD 2>/dev/null || die "$EX_ERR" "git worktree add failed for $branch"
+  created_wt=1
 fi
 
 # ---------------------------------------------------------------- opencode server
