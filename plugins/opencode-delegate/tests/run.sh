@@ -242,6 +242,9 @@ new_fixture badcopy
 brief="$FIX_ROOT/brief.md"; write_brief "$brief"
 run_oc --brief "$brief" --branch oc/badcopy --copy-untracked does/not/exist --dry-run
 neq "--copy-untracked refuses a path that does not exist" 0 "$STATUS"
+[[ -e "$FIX_REPO/.oc-worktrees/oc/badcopy" ]] \
+  && no "the bad-path refusal creates no worktree" "absent" "present" \
+  || ok "the bad-path refusal creates no worktree"
 
 new_fixture plaindispatch
 brief="$FIX_ROOT/brief.md"; write_brief "$brief"
