@@ -233,7 +233,8 @@ real values.
 
 ```
 oc-task --brief PATH [--role implement|review] [--model PROVIDER/MODEL] [--branch NAME] [--session ID|new] [--dry-run]
-        [--idle-timeout SECONDS] [--copy-untracked PATH]... [--no-link-node-modules]
+        [--idle-timeout SECONDS] [--copy-untracked PATH]...
+        [--link-node-modules|--no-link-node-modules]
 oc-task --branch-diff --branch NAME
 oc-task --merge (--branch NAME | --session ID) --verified "COMMAND" [-m MSG | --no-commit | --squash]
 ```
