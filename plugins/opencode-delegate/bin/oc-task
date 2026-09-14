@@ -310,13 +310,39 @@ if [[ $do_merge -eq 1 ]]; then
   done < <(git diff --name-only "$base...$branch")
   [[ ${#outside[@]} -eq 0 ]] || refuse "diff touches files not listed in the spec's # Files section:"$'\n'"$(printf '  %s\n' "${outside[@]}")"
   git diff --quiet "$base...$branch" && refuse "branch '$branch' has no changes relative to '$base'"
-  # 6. no conflicts. --no-ff so there is exactly one commit to revert.
-  msg=$(printf 'oc-task merge: %s\n\n%s %s\nmodel: %s\nspec: %s\nbranch: %s\nsession: %s\nverified: %s\n' \
-        "$branch" "$MERGE_MARKER" "$run_id" "$rmodel" "$rspec" "$branch" "$rsession" "$verified")
-  if ! git merge --no-ff --no-edit -m "$msg" "$branch" >/dev/null 2>&1; then
+  # The audit above is the valuable part and has already run in full. All that
+  # changes here is who writes the commit: the caller can supply the subject,
+  # or take the staged result and commit it themselves (field report #10).
+  trailer=$(printf '%s %s\nmodel: %s\nspec: %s\nbranch: %s\nsession: %s\nverified: %s\n' \
+        "$MERGE_MARKER" "$run_id" "$rmodel" "$rspec" "$branch" "$rsession" "$verified")
+  subject="${merge_msg:-oc-task merge: $branch}"
+  msg=$(printf '%s\n\n%s' "$subject" "$trailer")
+
+  if [[ $squash -eq 1 ]]; then
+    # --squash stages the branch's net change as an ordinary change set, so the
+    # caller's commit has a single parent and can be rewritten freely.
+    if ! git merge --squash "$branch" >/dev/null 2>&1; then
+      git merge --abort >/dev/null 2>&1 || true
+      refuse "merge conflicts between '$base' and '$branch' — resolve manually or re-dispatch"
+    fi
+  elif ! git merge --no-ff --no-commit "$branch" >/dev/null 2>&1; then
     git merge --abort >/dev/null 2>&1 || true
     refuse "merge conflicts between '$base' and '$branch' — resolve manually or re-dispatch"
   fi
+
+  if [[ $no_commit -eq 1 ]]; then
+    printf '%s\n' "$msg" > "$repo_root/.git/OC_TASK_MERGE_MSG"
+    echo "staged:  $branch -> $base ($( [[ $squash -eq 1 ]] && echo --squash || echo --no-ff ), not committed)"
+    echo "run:     $run_id  model: $rmodel  spec: $rspec"
+    echo "audit:   passed — every changed file is named in a brief's # Files section"
+    echo "next:    commit it yourself, e.g."
+    echo "           git commit -F .git/OC_TASK_MERGE_MSG"
+    echo "         keep the '$MERGE_MARKER $run_id' trailer if you want oc-undo to find it."
+    echo "abort:   git merge --abort  (or: git reset --hard HEAD)"
+    exit "$EX_OK"
+  fi
+
+  git commit -q --no-edit -m "$msg" || refuse "the merge staged cleanly but the commit failed"
   sha=$(git rev-parse --short HEAD)
   echo "merged:  $branch -> $base @ $sha (--no-ff)"
   echo "run:     $run_id  model: $rmodel  spec: $rspec"
