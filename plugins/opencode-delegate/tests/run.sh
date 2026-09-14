@@ -333,6 +333,12 @@ neq "a dirty tree is still refused" 0 "$STATUS"
 contains "and says why" "dirty" "$OUT"
 git -C "$FIX_REPO" reset -q --hard
 
+new_fixture noruns
+run_oc --merge --branch oc/noruns --verified "true"
+neq "--merge with no .oc-runs directory is refused" 0 "$STATUS"
+contains "it gives the tool's own refusal, not a bash error" "merge refused" "$OUT"
+contains "it names the missing run record" "no implement run record" "$OUT"
+
 section "the new flags are merge-only"
 new_fixture mergeonly
 brief="$FIX_ROOT/brief.md"; write_brief "$brief"

@@ -56,6 +56,9 @@ die()   { local code=$1; shift; echo "oc-task: $*" >&2; exit "$code"; }
 
 # Latest run record matching a jq filter, or empty.
 find_run() { # $1 = jq select expression
+  # No runs directory yet means no run records — the pipeline below already
+  # yields empty here, but saying so is cheaper to read than proving it.
+  [[ -d "$runs_dir" ]] || return 0
   ls "$runs_dir"/*.json 2>/dev/null | sort | while read -r f; do
     jq -e "select($1) | .run_id" "$f" >/dev/null 2>&1 && echo "$f"
   done | tail -1
