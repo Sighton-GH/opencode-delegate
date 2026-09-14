@@ -162,4 +162,53 @@ section "process group cleanup (finding #8)"
 contains "the run is started as its own process group" 'set -m' "$(cat "$OC_TASK")"
 contains "cleanup kills the run, not just the server" "kill_run" "$(cat "$OC_TASK")"
 
+section "provisioning the worktree (findings #6, #7)"
+new_fixture provision
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+mkdir -p "$FIX_REPO/inputs"
+printf 'untracked input\n' >"$FIX_REPO/inputs/raw.md"
+mkdir -p "$FIX_REPO/node_modules/.bin"
+printf 'dep\n' >"$FIX_REPO/node_modules/dep.js"
+
+run_oc --brief "$brief" --branch oc/prov --copy-untracked inputs
+eq "the dispatch succeeds" 0 "$STATUS"
+wt="$FIX_REPO/.oc-worktrees/oc/prov"
+eq "the untracked input is in the worktree" "untracked input" "$(cat "$wt/inputs/raw.md" 2>/dev/null)"
+[[ -L "$wt/node_modules" ]] && ok "node_modules is linked into the worktree" \
+  || no "node_modules is linked into the worktree" "a symlink" "$(ls -ld "$wt/node_modules" 2>&1)"
+eq "the link resolves to the base checkout's node_modules" "dep" \
+  "$(cat "$wt/node_modules/dep.js" 2>/dev/null | tr -d '\n')"
+
+tracked=$(git -C "$wt" log --name-only --pretty=format: | sort -u | grep -E '^(inputs|node_modules)' || true)
+eq "nothing provisioned was committed" "" "$tracked"
+rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
+contains "the record lists what was provisioned" "inputs" "$(jq -c .provisioned "$rec")"
+contains "including node_modules" "node_modules" "$(jq -c .provisioned "$rec")"
+
+run_oc --brief "$brief" --branch oc/prov --session new
+eq "a second run in the same worktree succeeds" 0 "$STATUS"
+tracked=$(git -C "$wt" log --name-only --pretty=format: | sort -u | grep -E '^(inputs|node_modules)' || true)
+eq "and still commits nothing provisioned" "" "$tracked"
+
+new_fixture noprovision
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+mkdir -p "$FIX_REPO/node_modules"
+run_oc --brief "$brief" --branch oc/nolink --no-link-node-modules
+eq "--no-link-node-modules dispatches fine" 0 "$STATUS"
+[[ -e "$FIX_REPO/.oc-worktrees/oc/nolink/node_modules" ]] \
+  && no "--no-link-node-modules leaves node_modules out" "absent" "present" \
+  || ok "--no-link-node-modules leaves node_modules out"
+
+new_fixture badcopy
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+run_oc --brief "$brief" --branch oc/badcopy --copy-untracked does/not/exist --dry-run
+neq "--copy-untracked refuses a path that does not exist" 0 "$STATUS"
+
+new_fixture plaindispatch
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+run_oc --brief "$brief" --branch oc/plain
+eq "a dispatch with no provisioning flags still works" 0 "$STATUS"
+rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
+eq "and records an empty provisioned list" "[]" "$(jq -c .provisioned "$rec")"
+
 summary
