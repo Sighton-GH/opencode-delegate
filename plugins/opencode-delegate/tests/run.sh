@@ -88,4 +88,39 @@ contains "the refusal lists live free models" "muse-spark-1.3-contributor-free" 
 run_oc --brief "$brief" --role sideways --dry-run
 eq "an unknown role is refused" 1 "$STATUS"
 
+section "session directory encoding (finding #1)"
+lacks "the session POST does not interpolate the raw worktree path" \
+  'directory=$worktree' "$(cat "$OC_TASK")"
+
+new_fixture encode
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+run_oc --brief "$brief" --branch oc/encode
+eq "a dispatch under a path with a space succeeds" 0 "$STATUS"
+recorded=$(cat "$FIX_STUB_STATE/session-directory" 2>/dev/null || echo "")
+eq "the server received the worktree path decoded and intact" \
+  "$FIX_REPO/.oc-worktrees/oc/encode" "$recorded"
+
+section "failed dispatch leaves nothing behind (finding #2)"
+new_fixture faildispatch
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_SESSION_STATUS=500 run_oc --brief "$brief" --branch oc/failed
+neq "a refused session-create is not reported as success" 0 "$STATUS"
+contains "the failure says the worktree was removed" "removed" "$OUT"
+eq "no worktree is left behind" "" "$(ls -A "$FIX_REPO/.oc-worktrees/oc" 2>/dev/null)"
+branches=$(git -C "$FIX_REPO" branch --list 'oc/failed')
+eq "no branch is left behind" "" "$branches"
+
+new_fixture orphanwt
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+git -C "$FIX_REPO" worktree add -q -b oc/orphan "$FIX_REPO/.oc-worktrees/oc/orphan" HEAD
+run_oc --brief "$brief" --branch oc/orphan --session new --dry-run
+eq "--session new adopts a recordless worktree" 0 "$STATUS"
+contains "it says the worktree already exists" "(existing)" "$OUT"
+
+new_fixture nothingatall
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+run_oc --brief "$brief" --branch oc/ghost --session new --dry-run
+neq "--session new still refuses when there is neither record nor worktree" 0 "$STATUS"
+contains "and says so plainly" "no worktree" "$OUT"
+
 summary
