@@ -19,11 +19,18 @@
 #   3  completed but zero changes
 #   4  session poisoned by image limit — unrecoverable
 #   5  rate limited by the provider
+#   6  stalled — no output for the idle timeout; the session is dead
 set -euo pipefail
 
 # Built-in default. Resolved from the live catalog (`opencode models --verbose`,
 # cost 0/0, name "Muse Spark 1.3 Free") on 2026-09-12. Override rather than edit.
 DEFAULT_MODEL="opencode/muse-spark-1.3-contributor-free"
+# How long a run may produce no output at all before the watchdog kills it.
+# The provider's *explicit* rate limit surfaces as an error and exits 5; the
+# silent one just stops emitting, with no error and no end of turn, and used to
+# hang until an operator noticed (field report #4). 0 disables the watchdog.
+DEFAULT_IDLE_TIMEOUT=420
+IDLE_POLL=5
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/oc-delegate"
 CONFIG_FILE="$CONFIG_DIR/config"
 IMPLEMENT_SECTIONS=("Objective" "Files" "Tasks" "Verification" "Definition of done" "Required output")
@@ -36,10 +43,15 @@ MERGE_MARKER="oc-task-run:"
 # #39677); it is not a context overflow, so opencode never auto-recovers from it.
 IMAGE_LIMIT_RE='exceeding the maximum of[^"]*images'
 RATE_LIMIT_RE='rate[ _-]?limit|too many requests|status(code)?[^0-9]*429|"429"|quota (exceeded|reached)|overloaded|capacity'
+# A session whose turn was interrupted — killed, or dropped mid-stream — loses
+# the reasoning state the provider expects back on the next turn, and every
+# subsequent turn fails instantly. Like the image limit it is unrecoverable,
+# so it gets the same treatment: mark the session dead and never retry it.
+POISON_RE='encrypted_content'
 
-EX_OK=0; EX_ERR=1; EX_SPEC=2; EX_NOCHANGE=3; EX_IMAGES=4; EX_RATE=5
+EX_OK=0; EX_ERR=1; EX_SPEC=2; EX_NOCHANGE=3; EX_IMAGES=4; EX_RATE=5; EX_STALL=6
 
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
 die()   { local code=$1; shift; echo "oc-task: $*" >&2; exit "$code"; }
 
 # Latest run record matching a jq filter, or empty.
@@ -102,6 +114,23 @@ discard_new_worktree() {
 # die(), but first undo a worktree this invocation created.
 die_fresh() { discard_new_worktree; die "$@"; }
 
+# Kill the run and everything it spawned. `set -m` when launching made the
+# child a process-group leader, so the negative pid reaches opencode's whole
+# tree; without that, killing the wrapper left the run alive and committing
+# while its server died with the parent (field report #8).
+kill_run() {
+  local pid="${run_pid:-}"
+  [[ -n "$pid" ]] || return 0
+  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.5
+  done
+  kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  return 0
+}
+
 # Test hook. `OC_TASK_SOURCE_ONLY=1 . oc-task` defines the helpers above and
 # returns before any argument parsing, dependency check, or repo lookup, so the
 # test suite can exercise them directly. `return` fails outside a sourced file,
@@ -109,13 +138,14 @@ die_fresh() { discard_new_worktree; die "$@"; }
 if [[ -n "${OC_TASK_SOURCE_ONLY:-}" ]]; then return 0 2>/dev/null || exit 0; fi
 
 # ---------------------------------------------------------------- arguments
-spec=""; model_arg=""; branch=""; session=""; do_merge=0; dry_run=0; verified=""; role="implement"; branch_diff=0
+spec=""; model_arg=""; idle_arg=""; branch=""; session=""; do_merge=0; dry_run=0; verified=""; role="implement"; branch_diff=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --brief|--spec) spec="${2:-}"; shift 2 ;;
     --role)     role="${2:-}"; shift 2 ;;
     --branch-diff) branch_diff=1; shift ;;
     --model)    model_arg="${2:-}"; shift 2 ;;
+    --idle-timeout) idle_arg="${2:-}"; shift 2 ;;
     --branch)   branch="${2:-}"; shift 2 ;;
     --session)  session="${2:-}"; shift 2 ;;
     --verified) verified="${2:-}"; shift 2 ;;
@@ -141,14 +171,23 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # Default model when neither --model nor \$OC_DELEGATE_MODEL is set.
 # Run \`oc-models --free\` for the live list.
 #model=$DEFAULT_MODEL
+# Seconds a run may produce no output before the watchdog kills it. 0 disables.
+#idle_timeout=$DEFAULT_IDLE_TIMEOUT
 EOF
 fi
 config_model=$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*//p' "$CONFIG_FILE" | tail -1 | tr -d '[:space:]')
+config_idle=$(sed -n 's/^[[:space:]]*idle_timeout[[:space:]]*=[[:space:]]*//p' "$CONFIG_FILE" | tail -1 | tr -d '[:space:]')
 if   [[ -n "$model_arg" ]];                   then model="$model_arg";              model_src="--model"
 elif [[ -n "${OC_DELEGATE_MODEL:-}" ]];       then model="$OC_DELEGATE_MODEL";      model_src="\$OC_DELEGATE_MODEL"
 elif [[ -n "$config_model" ]];                then model="$config_model";           model_src="$CONFIG_FILE"
 else                                               model="$DEFAULT_MODEL";          model_src="built-in default"
 fi
+if   [[ -n "$idle_arg" ]];                        then idle_timeout="$idle_arg"
+elif [[ -n "${OC_DELEGATE_IDLE_TIMEOUT:-}" ]];    then idle_timeout="$OC_DELEGATE_IDLE_TIMEOUT"
+elif [[ -n "$config_idle" ]];                     then idle_timeout="$config_idle"
+else                                                   idle_timeout="$DEFAULT_IDLE_TIMEOUT"
+fi
+[[ "$idle_timeout" =~ ^[0-9]+$ ]] || die "$EX_ERR" "--idle-timeout takes whole seconds (0 disables), got: $idle_timeout"
 [[ "$model" == */* ]] || die "$EX_ERR" "model must be provider/model, got: $model"
 # Fail fast on a model that is not in the live catalog (free-tier ids rotate);
 # otherwise it only surfaces as a generic server error after the worktree exists.
@@ -247,8 +286,10 @@ spec_rel=$(realpath --relative-to="$repo_root" "$spec_abs" 2>/dev/null || echo "
 #   (neither)               fresh branch + worktree off current HEAD
 resume=0; reuse_wt=0
 if [[ -n "$session" && "$session" != "new" ]]; then
-  dead=$(find_run ".session_id == \"$session\" and .dead == true")
-  [[ -z "$dead" ]] || die "$EX_IMAGES" "session $session is recorded as dead (image limit) in $dead — it can never be retried. Start a fresh session: --session new --branch <branch>"
+  dead_rec=$(find_run ".session_id == \"$session\" and .dead == true")
+  if [[ -n "$dead_rec" ]]; then
+    die "$EX_IMAGES" "session $session is recorded as dead ($(jq -r '.dead_reason // "unrecoverable"' "$dead_rec")) in $dead_rec — it can never be retried. Start a fresh session: --session new --branch $(jq -r .branch "$dead_rec")"
+  fi
   rec=$(find_run ".session_id == \"$session\"") || true
   [[ -n "$rec" ]] || die "$EX_ERR" "no run record in $RUNS_DIR for session $session"
   branch=$(jq -r .branch "$rec"); base_branch=$(jq -r .base_branch "$rec"); base_sha=$(jq -r .base_sha "$rec")
@@ -314,9 +355,18 @@ fi
 # opencode reads stdin to EOF whenever stdin is not a TTY (inside an agent's shell
 # it is a socket that never closes), so every opencode/curl call below gets an
 # explicit stdin and a timeout.
-serve_pid=""; serve_log=$(mktemp)
-cleanup() { [[ -n "$serve_pid" ]] && kill "$serve_pid" 2>/dev/null; rm -f "$serve_log"; }
+serve_pid=""; run_pid=""; serve_log=$(mktemp)
+# A killed wrapper must mean a killed run. Previously the trap took the server
+# down but left `opencode run` alive, so the run kept committing with nothing
+# to talk to and no summary was ever written (field report #8).
+cleanup() {
+  kill_run
+  [[ -n "${serve_pid:-}" ]] && { kill "$serve_pid" 2>/dev/null || true; }
+  rm -f "$serve_log"
+  return 0
+}
 trap cleanup EXIT
+trap 'trap - EXIT; cleanup; exit 143' INT TERM HUP
 url=""
 for attempt in 1 2 3 4 5; do
   port=$(( 20000 + RANDOM % 40000 ))
@@ -352,10 +402,33 @@ fi
 agent_args=(); [[ $role == review ]] && agent_args=(--agent plan)
 start_sha=$(git -C "$worktree" rev-parse HEAD)
 start=$(date +%s)
+stalled=0
 set +e
-( cd "$worktree" && opencode run --attach "$url" --session "$session" --dir "$worktree" \
-    "${agent_args[@]}" --model "$model" --format json --auto <"$spec_abs" >"$log" 2>&1 )
+# Job control puts the background job in its own process group, which is what
+# lets kill_run reach opencode's whole tree.
+set -m
+( cd "$worktree" && exec opencode run --attach "$url" --session "$session" --dir "$worktree" \
+    "${agent_args[@]}" --model "$model" --format json --auto <"$spec_abs" >"$log" 2>&1 ) &
+run_pid=$!
+set +m
+if [[ "$idle_timeout" -gt 0 ]]; then
+  last_size=-1; last_change=$(date +%s)
+  while kill -0 "$run_pid" 2>/dev/null; do
+    sleep "$IDLE_POLL"
+    size=$(wc -c <"$log" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    if [[ "$size" != "$last_size" ]]; then
+      last_size="$size"; last_change="$now"
+    elif (( now - last_change >= idle_timeout )); then
+      stalled=1
+      kill_run
+      break
+    fi
+  done
+fi
+wait "$run_pid"
 oc_exit=$?
+run_pid=""
 set -e
 duration=$(( $(date +%s) - start ))
 kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true; serve_pid=""
@@ -390,11 +463,17 @@ errors=$(jq -r 'select(.type=="error") | (.error.name // "error") + ": " + (.err
 [[ -n "$errors" ]] || errors=$(grep -vE '^\{' "$log" | grep -iE 'error|fail' | head -3 || true)
 err_events=$(jq -r 'select(.type=="error") | .type' "$log" 2>/dev/null || true)
 
-status=$EX_OK; status_txt="success"; dead=false
+status=$EX_OK; status_txt="success"; dead=false; dead_reason=""
+resume_hint="re-dispatch with --session new --branch $branch (checkpoint ${head_sha:-${base_sha:0:7}})"
 if grep -qiE "$IMAGE_LIMIT_RE" <<<"$errors" || { [[ $oc_exit -ne 0 ]] && grep -qiE "$IMAGE_LIMIT_RE" "$log"; }; then
-  status=$EX_IMAGES; dead=true
-  status_txt="session poisoned by image limit — not resumable. Start a fresh session from checkpoint ${head_sha:-${base_sha:0:7}}."
-  jq -cn --arg s "$session" --arg r "$run_id" '{type:"oc-task",event:"session-dead",reason:"image-limit",session_id:$s,run_id:$r}' >> "$log"
+  status=$EX_IMAGES; dead=true; dead_reason="image-limit"
+  status_txt="session poisoned by image limit — not resumable. $resume_hint"
+elif [[ $stalled -eq 1 ]]; then
+  status=$EX_STALL; dead=true; dead_reason="stalled"
+  status_txt="stalled — no output for ${idle_timeout}s, run killed. Killing a run poisons its session, so it is not resumable: $resume_hint"
+elif grep -qiE "$POISON_RE" <<<"$errors" || { [[ $oc_exit -ne 0 ]] && grep -qiE "$POISON_RE" "$log"; }; then
+  status=$EX_IMAGES; dead=true; dead_reason="encrypted-content"
+  status_txt="session poisoned — the provider rejected this session's reasoning state (encrypted_content), which an interrupted turn always causes. not resumable: $resume_hint"
 elif [[ $oc_exit -ne 0 ]] || { [[ -n "$err_events" ]] && [[ -z "$result" ]]; }; then
   if grep -iqE "$RATE_LIMIT_RE" <<<"$errors"; then status=$EX_RATE; status_txt="rate limited by the provider — retry later, do not loop"
   else status=$EX_ERR; status_txt="opencode errored"; fi
@@ -403,12 +482,18 @@ elif [[ -z "$numstat" && $role == implement ]]; then
 elif [[ $role == review && -z "$result" ]]; then
   status=$EX_ERR; status_txt="review finished without a ## RESULT block"
 fi
+if [[ "$dead" == true ]]; then
+  jq -cn --arg s "$session" --arg r "$run_id" --arg reason "$dead_reason" \
+     '{type:"oc-task",event:"session-dead",reason:$reason,session_id:$s,run_id:$r}' >> "$log"
+fi
 
 jq -n --arg run_id "$run_id" --arg branch "$branch" --arg worktree "$worktree" \
       --arg base_branch "$base_branch" --arg base_sha "$base_sha" --arg model "$model" \
       --arg spec "$spec_rel" --arg role "$role" --arg start_sha "$start_sha" \
       --arg session_id "$session" --argjson exit_code "$status" \
       --argjson oc_exit "$oc_exit" --argjson duration "$duration" --argjson dead "$dead" \
+      --arg dead_reason "$dead_reason" --argjson stalled "$stalled" \
+      --argjson idle_timeout "$idle_timeout" \
       --arg head_sha "$head_sha" --arg result "$result" --arg log "$log" --arg diff "$diff_out" \
       '$ARGS.named' > "$rec_out"
 
