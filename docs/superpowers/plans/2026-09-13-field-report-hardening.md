@@ -1154,8 +1154,10 @@ add:
 ```bash
 # Fail before anything is created: a typo'd input path is much cheaper to
 # report now than after a worktree exists.
+# Note `${arr[@]:-}` on an empty array yields one empty element under `set -u`,
+# so skip empties rather than treating one as a missing argument.
 for p in "${copy_untracked[@]:-}"; do
-  [[ -n "$p" ]] || die "$EX_ERR" "--copy-untracked needs a path"
+  [[ -n "$p" ]] || continue
   [[ -e "$p" ]] || die "$EX_ERR" "--copy-untracked: no such path in the base checkout: $p"
 done
 ```
