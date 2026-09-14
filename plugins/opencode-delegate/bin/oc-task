@@ -131,6 +131,30 @@ kill_run() {
   return 0
 }
 
+# Where a worktree's provisioning list lives. It goes in the worktree's own git
+# dir, which `git rev-parse --git-dir` reports as an absolute path for a linked
+# worktree, and NOT in info/exclude: git resolves that to the *common* git dir,
+# so writing there would make the user's own checkout start ignoring these
+# paths — a side effect outside the worktree.
+provision_file() { git -C "$worktree" rev-parse --git-dir 2>/dev/null | sed 's|$|/oc-provisioned|'; }
+
+# Record a path as provisioned: present in the worktree, never part of the diff.
+provision_add() { # $1 = path relative to the worktree root
+  local f; f=$(provision_file); [[ -n "$f" ]] || return 0
+  grep -qxF "$1" "$f" 2>/dev/null || printf '%s\n' "$1" >> "$f"
+  return 0
+}
+
+# Pathspecs that keep every provisioned path out of `git status`, `git add` and
+# `git clean`. Verified to work for directories and for symlinks.
+provision_pathspec() {
+  local f p; f=$(provision_file)
+  printf '%s\n' "."
+  [[ -f "$f" ]] || return 0
+  while IFS= read -r p; do [[ -n "$p" ]] && printf ':(exclude)%s\n' "$p"; done < "$f"
+  return 0
+}
+
 # Test hook. `OC_TASK_SOURCE_ONLY=1 . oc-task` defines the helpers above and
 # returns before any argument parsing, dependency check, or repo lookup, so the
 # test suite can exercise them directly. `return` fails outside a sourced file,
@@ -138,7 +162,7 @@ kill_run() {
 if [[ -n "${OC_TASK_SOURCE_ONLY:-}" ]]; then return 0 2>/dev/null || exit 0; fi
 
 # ---------------------------------------------------------------- arguments
-spec=""; model_arg=""; idle_arg=""; branch=""; session=""; do_merge=0; dry_run=0; verified=""; role="implement"; branch_diff=0
+spec=""; model_arg=""; idle_arg=""; branch=""; session=""; do_merge=0; dry_run=0; verified=""; role="implement"; branch_diff=0; copy_untracked=(); link_nm=auto
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --brief|--spec) spec="${2:-}"; shift 2 ;;
@@ -151,12 +175,23 @@ while [[ $# -gt 0 ]]; do
     --verified) verified="${2:-}"; shift 2 ;;
     --merge)    do_merge=1; shift ;;
     --dry-run)  dry_run=1; shift ;;
+    --copy-untracked) copy_untracked+=("${2:-}"); shift 2 ;;
+    --link-node-modules)    link_nm=yes; shift ;;
+    --no-link-node-modules) link_nm=no;  shift ;;
     -h|--help)  usage; exit 0 ;;
     *) usage >&2; die "$EX_ERR" "unknown argument: $1" ;;
   esac
 done
 
 case "$role" in implement|review) ;; *) die "$EX_ERR" "--role must be implement or review, got: $role" ;; esac
+# Fail before anything is created: a typo'd input path is much cheaper to
+# report now than after a worktree exists. Note `${arr[@]:-}` on an empty array
+# yields one empty element under `set -u`, so skip empties rather than treating
+# one as a missing argument.
+for p in "${copy_untracked[@]:-}"; do
+  [[ -n "$p" ]] || continue
+  [[ -e "$p" ]] || die "$EX_ERR" "--copy-untracked: no such path in the base checkout: $p"
+done
 if [[ $role == review ]]; then REQUIRED_SECTIONS=("${REVIEW_SECTIONS[@]}"); else REQUIRED_SECTIONS=("${IMPLEMENT_SECTIONS[@]}"); fi
 
 for dep in git opencode jq curl; do
@@ -349,6 +384,60 @@ else
   ! git show-ref --verify --quiet "refs/heads/$branch" || die "$EX_ERR" "branch '$branch' already exists; choose another --branch"
   git worktree add -q -b "$branch" "$worktree" HEAD 2>/dev/null || die "$EX_ERR" "git worktree add failed for $branch"
   created_wt=1
+  # The worktree forks from HEAD, so anything untracked — the very files a task
+  # is often about — is simply missing from it, and node_modules is never there
+  # at all (field report #6, #7). Provision both, and remember what we put
+  # there so it never reaches the diff.
+  for p in "${copy_untracked[@]:-}"; do
+    [[ -n "$p" ]] || continue
+    rel="${p#./}"; rel="${rel%/}"
+    mkdir -p "$worktree/$(dirname "$rel")"
+    cp -a "$repo_root/$rel" "$worktree/$rel"
+    provision_add "$rel"
+    echo "oc-task: copied untracked $rel into the worktree" >&2
+  done
+  if [[ "$link_nm" == yes || ( "$link_nm" == auto && -d "$repo_root/node_modules" && ! -e "$worktree/node_modules" ) ]]; then
+    if [[ -d "$repo_root/node_modules" ]]; then
+      ln -s "$repo_root/node_modules" "$worktree/node_modules"
+      provision_add "node_modules"
+      echo "oc-task: linked node_modules into the worktree" >&2
+    elif [[ "$link_nm" == yes ]]; then
+      die_fresh "$EX_ERR" "--link-node-modules: no node_modules in $repo_root"
+    fi
+  fi
+fi
+
+# Provisioned paths must stay out of every commit made inside this worktree,
+# not just oc-task's own checkpoint (which the pathspecs above cover): the
+# model commits mid-run with a plain `git add -A` that takes no pathspec, and
+# that would put the provisioned inputs and symlink on the branch (field
+# report #6, #7). An excludes file hides them from every git invocation, but
+# it cannot live in info/exclude — git resolves that to the common dir shared
+# with the base checkout, and even `git config` in a linked worktree writes
+# there, so the base would start ignoring these paths too — and a .gitignore
+# would itself be committed. Instead, export core.excludesFile for this
+# process tree only: it reaches opencode and every git it spawns, changes no
+# config file anywhere, and vanishes with this process. Later runs in the
+# same worktree rebuild nothing; the private files persist with the worktree.
+prov_list=$(provision_file) || prov_list=""
+if [[ -n "$prov_list" && -s "$prov_list" ]]; then
+  prov_excl="${prov_list}.excludes"
+  if [[ ! -f "$prov_excl" ]]; then
+    : > "$prov_excl" || true
+    # Our value shadows the operator's configured excludes file inside this
+    # process tree, so carry its patterns over rather than dropping them.
+    prev_excl=$(git config --get core.excludesFile 2>/dev/null || true)
+    prev_excl="${prev_excl/#\~/$HOME}"
+    if [[ -n "$prev_excl" && -f "$prev_excl" ]]; then
+      cat "$prev_excl" >> "$prov_excl" || true
+    else
+      for g in "${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore" "$HOME/.config/git/ignore"; do
+        if [[ -f "$g" ]]; then cat "$g" >> "$prov_excl" || true; break; fi
+      done
+    fi
+    cat "$prov_list" >> "$prov_excl" || true
+  fi
+  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.excludesFile GIT_CONFIG_VALUE_0="$prov_excl"
 fi
 
 # ---------------------------------------------------------------- opencode server
@@ -438,12 +527,14 @@ kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true; se
 # checkpoint so this run's diff is the whole story. Review runs must not change
 # anything; if one somehow did, discard it and say so.
 review_note=""
-if [[ -n "$(git -C "$worktree" status --porcelain)" ]]; then
+mapfile -t wt_pathspec < <(provision_pathspec)
+if [[ -n "$(git -C "$worktree" status --porcelain -- "${wt_pathspec[@]}")" ]]; then
   if [[ $role == review ]]; then
-    review_note="reviewer modified $(git -C "$worktree" status --porcelain | wc -l) file(s); changes discarded"
-    git -C "$worktree" reset -q --hard && git -C "$worktree" clean -qfd
+    review_note="reviewer modified $(git -C "$worktree" status --porcelain -- "${wt_pathspec[@]}" | wc -l) file(s); changes discarded"
+    git -C "$worktree" reset -q --hard
+    git -C "$worktree" clean -qfd -- "${wt_pathspec[@]}"
   else
-    git -C "$worktree" add -A >/dev/null 2>&1
+    git -C "$worktree" add -A -- "${wt_pathspec[@]}" >/dev/null 2>&1
     git -C "$worktree" -c user.name=oc-task -c user.email=oc-task@localhost \
         commit -q -m "oc-task: uncommitted changes at end of run $run_id" >/dev/null 2>&1 || true
   fi
@@ -487,6 +578,12 @@ if [[ "$dead" == true ]]; then
      '{type:"oc-task",event:"session-dead",reason:$reason,session_id:$s,run_id:$r}' >> "$log"
 fi
 
+# The `|| true` keeps `set -euo pipefail` from exiting when the provision file
+# does not exist yet: the missing-file test on the left then fails the whole
+# pipeline even though jq still prints `[]` for the empty input.
+provisioned_json=$( { [[ -f "$(provision_file)" ]] && cat "$(provision_file)"; } 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))' || true )
+[[ -n "$provisioned_json" ]] || provisioned_json='[]'
+
 jq -n --arg run_id "$run_id" --arg branch "$branch" --arg worktree "$worktree" \
       --arg base_branch "$base_branch" --arg base_sha "$base_sha" --arg model "$model" \
       --arg spec "$spec_rel" --arg role "$role" --arg start_sha "$start_sha" \
@@ -494,6 +591,7 @@ jq -n --arg run_id "$run_id" --arg branch "$branch" --arg worktree "$worktree" \
       --argjson oc_exit "$oc_exit" --argjson duration "$duration" --argjson dead "$dead" \
       --arg dead_reason "$dead_reason" --argjson stalled "$stalled" \
       --argjson idle_timeout "$idle_timeout" \
+      --argjson provisioned "$provisioned_json" \
       --arg head_sha "$head_sha" --arg result "$result" --arg log "$log" --arg diff "$diff_out" \
       '$ARGS.named' > "$rec_out"
 
