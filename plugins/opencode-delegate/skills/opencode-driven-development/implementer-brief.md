@@ -27,6 +27,14 @@ assets by path only. If a task appears to require viewing an image, stop and
 report it rather than opening it.
 Do not spawn subagents or sub-tasks; do all of this work yourself. Review
 arrives from the controller after you report.
+Never use `git stash` in any form: the stash is shared by every worktree of
+this repository, so a pop here can apply someone else's work.
+Do not run `npm ci`, `npm install` or any other package install unless a step
+below says to; the dependencies are already in place.
+If a step needs a literal escape sequence in a file (`\u0000`, `\x1b`, an
+octal escape), check the file afterwards with `od -c <file> | head`. If the
+raw byte landed instead of the backslash form, rewrite that line with a small
+script that prints the backslash form, and say so in your report.
 No new dependencies unless listed here: <none | list>.
 Out of scope — do not touch: <files and areas that must not change>.
 Follow the existing patterns in the files named under Context. Improve code
@@ -95,8 +103,15 @@ Notes:
   exactly.
 - **Constraints** — the image sentence and the no-subagents sentence are
   VERBATIM. An opencode session dies permanently at 50 images.
+- **Constraints** — the stash, install and escape-sequence sentences are
+  VERBATIM too. `oc-task` denies `git stash` at the permission layer as well;
+  the sentence saves the model a refused call. A model's edit tool has written
+  `\u0000` as a raw NUL; `oc-task` flags a diff that adds control bytes, and
+  the `od -c` check catches it before the commit.
 - **Files** — `oc-task --merge` refuses if the branch touches anything not
-  listed in *some* brief's Files section. Directories end in `/`; globs work.
+  listed in *some* brief's Files section. Write every path in full, relative
+  to the repository root. Directories end in `/`; globs work. A bare filename
+  after a full path on the same line is read as a sibling of that path.
 - **Tasks** — the commit-per-step instruction is VERBATIM; checkpoints are
   what survive an image-limit death.
 - **Verification** — VERBATIM shape. You re-run this same command; make it
@@ -105,11 +120,16 @@ Notes:
   `--minify` strips attribute quotes, so `grep 'id="x"'` fails on correct
   output and the implementer correctly reports BLOCKED). Check the real
   output once yourself before putting a grep in a brief.
-- **node_modules in the worktree** — `oc-task` links the base checkout's
-  `node_modules` into a fresh worktree automatically. Because it is a symlink,
-  `npx <tool>` can fail with `Permission denied`; call the CLI entry point
-  directly instead — e.g. `node node_modules/@playwright/test/cli.js test` —
-  and put that exact form in the brief's Verification section.
+- **node_modules in the worktree** — `oc-task` gives a fresh worktree its own
+  `node_modules` directory whose entries link to the base checkout's packages
+  (nested workspace installs too), with workspace packages pointing at the
+  worktree's own copies. An install inside the worktree replaces those links
+  instead of writing through them. Packages are still shared, so `npx <tool>`
+  can fail with `Permission denied`; call the CLI entry point directly
+  instead — e.g. `node node_modules/@playwright/test/cli.js test` — and put
+  that exact form in the brief's Verification section. When the gates must
+  see a dependency change (a lockfile edit, a new workspace package), dispatch
+  the first task with `--install` and say so in the brief.
 - **Required output** — VERBATIM. `oc-task` extracts the block; `Status:` is
   how you route the result.
 
@@ -154,3 +174,21 @@ For rounds 4–5 (fresh session, different model) use the full template again,
 add under Context: "A prior implementer attempted this task R times. Read
 `.oc-runs/<plan-slug>/task-N-brief.md` for the original requirements; the
 open findings are the Tasks below. You own it now."
+
+## Continuation brief (after a dead or stopped session)
+
+Dispatch with `--session new --branch B --continue-from <the original
+brief>`. The continuation needs only what changed — `oc-task` accepts it when
+the parent supplies the other required sections, sends the parent along
+below it, and counts the parent's `# Files` at merge:
+
+```markdown
+# Objective
+Continue Task N: steps 1–2 are done at commits <a>, <b>. Start at step 3.
+
+# Tasks
+3. <step 3 from the original, verbatim>
+4. <step 4>
+Run `git add -A && git commit` after completing each numbered step, with the
+step number in the commit message.
+```

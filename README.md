@@ -76,12 +76,27 @@ your PATH and `chmod +x` it.
 
 ## Install
 
-From inside Claude Code:
+From inside Claude Code 2.1.275 or later, one command adds the marketplace
+and installs the plugin:
 
 ```
-/plugin marketplace add Sighton-GH/opencode-delegate
-/plugin install opencode-delegate
+/plugin install opencode-delegate --marketplace Sighton-GH/opencode-delegate
 ```
+
+On an older Claude Code, run these two commands one at a time — paste the
+first, wait for it to finish, then paste the second.
+
+1. Add the marketplace:
+
+   ```
+   /plugin marketplace add Sighton-GH/opencode-delegate
+   ```
+
+2. Install the plugin:
+
+   ```
+   /plugin install opencode-delegate
+   ```
 
 Then start a new Claude Code session (plugins load at startup). To confirm
 it's live, ask Claude to run `oc-models --free` — you should see a list of
@@ -102,7 +117,15 @@ the GitHub one:
 ```
 git clone https://github.com/Sighton-GH/opencode-delegate.git
 cd opencode-delegate
+```
+
+Then, from the clone, register it (one command at a time):
+
+```
 claude plugin marketplace add "$PWD"
+```
+
+```
 claude plugin install opencode-delegate@opencode-delegate
 ```
 
@@ -110,18 +133,31 @@ Edits to `bin/` take effect immediately (the scripts run from your clone).
 Edits to `SKILL.md` take effect in the next session. Before committing:
 
 ```
+bash plugins/opencode-delegate/tests/run.sh
+```
+
+```
 claude plugin validate ./plugins/opencode-delegate --strict
+```
+
+```
+claude plugin validate . --strict
 ```
 
 To ship a change to people installed from GitHub, bump `version` in both
 `plugins/opencode-delegate/.claude-plugin/plugin.json` and
 `.claude-plugin/marketplace.json` — `claude plugin update` only refetches when
-the version changes. Users then run:
+the version changes. Users then run these one at a time:
 
 ```
 claude plugin marketplace update opencode-delegate
+```
+
+```
 claude plugin update opencode-delegate
 ```
+
+What changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 ## When it fires
 
@@ -232,9 +268,10 @@ real values.
 ### `oc-task`
 
 ```
-oc-task --brief PATH [--role implement|review] [--model PROVIDER/MODEL] [--branch NAME] [--session ID|new] [--dry-run]
-        [--idle-timeout SECONDS] [--copy-untracked PATH]...
-        [--link-node-modules|--no-link-node-modules]
+oc-task --brief PATH [--role implement|review] [--model PROVIDER/MODEL] [--branch NAME] [--base REF]
+        [--session ID|new] [--continue-from PARENT_BRIEF] [--idle-timeout SECONDS]
+        [--copy-untracked PATH]... [--install | --link-node-modules | --no-link-node-modules]
+        [--dry-run]
 oc-task --branch-diff --branch NAME
 oc-task --merge (--branch NAME | --session ID) --verified "COMMAND" [-m MSG | --no-commit | --squash]
 ```
@@ -245,16 +282,53 @@ session over its HTTP API, runs `opencode run --attach … --auto` with the
 brief on stdin, commits anything left uncommitted as a final checkpoint,
 and prints the summary. Files:
 
+- `.oc-runs/RUNID.json` — run record (branch, base, session, role, exit,
+  RESULT). Written at dispatch with `"state": "running"` and rewritten when
+  the run ends, so a run whose wrapper died still leaves its session id,
+  base and brief behind.
+- `.oc-runs/RUNID.summary` — the printed summary, saved before it is printed
 - `.oc-runs/RUNID.diff` — this run's changes only (commit list + diff with
   10 lines of context) — the review package for that task
 - `.oc-runs/RUNID.log` — raw JSON event stream; read only when a run fails
-- `.oc-runs/RUNID.json` — run record (branch, base, session, role, exit, RESULT)
+- `.oc-runs/RUNID.serve.log` — the run's own server log (WARN and above).
+  Provider errors — rate limits, usage caps, upstream failures — are written
+  here and nowhere else; the summary's `errors:` section quotes them as
+  `server:` lines.
+
+Every path out of a dispatch writes the record and the summary: a normal
+end, a signal (INT, TERM, HUP — exit 128+N, the run is stopped and its work
+checkpointed), and a failure inside oc-task itself (exit 1, naming the line
+that failed). The wrapper prints `oc-task: dispatched run RUNID (session ID)`
+to stderr as the model starts, so a long run can be followed in its log.
 
 Worktree rules: the first run on a branch creates `.oc-worktrees/NAME` off
-current HEAD. `--session ID` resumes that session in its worktree.
-`--session new --branch NAME` starts a fresh session in the existing
-worktree (every task after the first; continuation after a dead
-session). Anything else with an existing worktree is refused.
+current HEAD, or off `--base REF` — a sibling branch a task depends on, or
+another tool's branch a review should read. The record keeps REF's commit as
+the branch base, so `--branch-diff` shows only this branch's own changes;
+merge the base branch first, or `--merge`'s audit sees its files too.
+`--session ID` resumes that session in its worktree. `--session new --branch
+NAME` starts a fresh session in the existing worktree (every task after the
+first; continuation after a dead session). It also adopts a branch that has
+no worktree or run record — one made by hand or by another tool — and gives
+it a worktree; a branch oc-task did not create is never deleted. Anything
+else with an existing worktree or branch is refused, with the command that
+would work.
+
+One run per worktree: a dispatch into a worktree where another oc-task run
+is live is refused, because a review's cleanup resets the worktree it ran in
+and would discard the live run's uncommitted work. Runs on different
+branches may overlap, but a free tier limits per account, not per run;
+oc-task warns when other live `opencode run` processes use the same model.
+
+`--continue-from PARENT_BRIEF` is for continuation and follow-up briefs. The
+brief then needs only the sections it changes: every required section it
+lacks must be in the parent, the model receives the brief with the parent
+below it, and `--merge` counts the parent's `# Files` as well.
+
+Sessions are created with every permission allowed except `git stash`, which
+is denied (`*git stash*`, `*git -C * stash*`). The stash is shared by every
+worktree of a repository; a model's `git stash pop` once applied the user's
+own WIP stash into its worktree.
 
 `--role review` runs opencode's built-in read-only `plan` agent: it can read,
 grep, and run commands, but every edit is denied. Required brief sections
@@ -271,19 +345,28 @@ run) > built-in `opencode/muse-spark-1.3-contributor-free`. Any id not in
 the live catalog is refused immediately with the current free list.
 
 `--dry-run` prints the resolved model, branch, worktree, and section check
-without creating anything.
+without creating anything. A rejected brief lists every missing section at
+once.
 
 `--idle-timeout SECONDS` sets how long a run may produce no output at all
 before the watchdog kills it. Default 420 (7 minutes); `0` disables the
 watchdog. Also settable as `idle_timeout=` in
 `${XDG_CONFIG_HOME:-~/.config}/oc-delegate/config` or as
 `$OC_DELEGATE_IDLE_TIMEOUT`. Precedence: flag, then environment, then config,
-then built-in default — the same order as the model setting. The provider's
-explicit rate limit surfaces as an error and exits 5; the silent throttle
-stops emitting with no error and no end of turn, and before v0.4.0 it hung
-until an operator noticed. A killed run poisons its session (the reasoning
-state the provider expects back is lost), so exit 6 also records the session
-dead.
+then built-in default — the same order as the model setting. A killed run
+poisons its session (the reasoning state the provider expects back is lost),
+so exit 6 also records the session dead.
+
+The watchdog also reads the run's server log every few seconds, because a
+provider's refusal lands there while the run itself just goes quiet. A usage
+cap (`Usage limit reached. Resets in 3h 51m.`) stops the run at once with
+exit 5 and the reset time. A rate limit gets `rate_limit_grace` seconds
+(default 90; `rate_limit_grace=` in the config or
+`$OC_DELEGATE_RATE_LIMIT_GRACE`) for opencode's own retry to recover — any
+new output clears it — and then exits 5. An error event in the run's own
+stream followed by 60 seconds of silence (`$OC_DELEGATE_ERROR_GRACE`) is
+stopped as exit 1. A stall that coincides with a provider rate limit, or a
+run that produced no model output at all, is reported as 5 rather than 6.
 
 `--copy-untracked PATH` (repeatable) copies a path from the base checkout into
 a freshly created worktree and keeps it out of the run's diff. A worktree forks
@@ -291,24 +374,55 @@ from `HEAD`, so files a user just dropped in — often the very inputs a task is
 about — are simply missing from it. The copy is recorded in the run record's
 `provisioned` list and excluded from every git operation inside the worktree.
 
-`--link-node-modules` / `--no-link-node-modules` controls whether `node_modules`
-is symlinked from the base checkout into a fresh worktree. The default (`auto`)
-links it when the repo root has a `node_modules` directory. Because it is a
-symlink, `npx <tool>` can fail with `Permission denied`; call the CLI entry
-point directly instead (e.g. `node node_modules/@playwright/test/cli.js test`)
-and put that exact form in the brief's Verification section.
+Dependencies in a fresh worktree. By default (`auto`, when the repo root
+has a `node_modules`) the worktree gets its **own** `node_modules`
+directory whose entries are links to the base checkout's packages, and the
+same for every workspace with an install of its own (`packages/x/node_modules`).
+Workspace packages — npm's relative links into the repo — resolve to the
+worktree's copies, so a cross-package typecheck reads the branch's code;
+`.cache`, `.vite` and `.vite-temp` are left out. Because the directory is
+real, an `npm ci` or `npm install` inside the worktree replaces the links
+instead of writing through them. Before 0.5.0 the whole directory was one
+symlink: workspace packages resolved to the base checkout, and an `npm ci`
+in the worktree emptied the base checkout's `node_modules`.
+
+- `--install` runs the lockfile's clean install in the new worktree instead
+  (`npm ci`, `pnpm install --frozen-lockfile`, `yarn install
+  --frozen-lockfile` or `bun install --frozen-lockfile`; log in
+  `.oc-runs/RUNID.install.log`). Use it when the gates must see a
+  dependency change, a new workspace package, or built workspace output.
+- `--link-node-modules` links even when it would not by default, and fails
+  if the base checkout has no `node_modules`.
+- `--no-link-node-modules` leaves dependencies out entirely.
+- When the base checkout has a `package.json` but no `node_modules` (a
+  fresh clone, or a Claude Code worktree), oc-task warns and suggests
+  `--install`.
+
+Packages are still links, so `npx <tool>` can fail with `Permission
+denied`; call the CLI entry point directly instead (e.g. `node
+node_modules/@playwright/test/cli.js test`) and put that exact form in the
+brief's Verification section.
+
+The summary's `warning:` lines also flag what a reviewer should look at: a
+checkpoint that failed (the run's last work is still uncommitted in the
+worktree), a source file whose diff is binary or gained raw control bytes
+(an escape sequence like `\u0000` written as the byte itself), other live
+runs on the same model, and an opencode database over 5 GB (see "Disk
+usage" below).
 
 Exit codes:
 
 | Code | Meaning |
 |---|---|
 | 0 | success (implement: changes produced; review: RESULT block present) |
-| 1 | opencode errored, or a setup problem |
+| 1 | opencode errored, a setup problem, or a failure inside oc-task (the summary names the line) |
 | 2 | brief rejected — missing or malformed sections |
-| 3 | implement run completed but produced zero changes |
+| 3 | implement run completed but produced zero changes (the exit line says so when the model stopped with NEEDS_CONTEXT or BLOCKED) |
 | 4 | session unrecoverable — image limit or a poisoned reasoning state (never retried) |
-| 5 | rate limited by the provider |
-| 6 | stalled (no output for the idle timeout; session dead) |
+| 5 | rate or usage limited by the provider, or no model output at all (`limit:` and `reset:` lines say which and until when) |
+| 6 | stalled (output, then none for the idle timeout; session dead) |
+| 7 | opencode's local database was busy — another run, a bulk `opencode session delete`, a `VACUUM` |
+| 128+N | the wrapper was killed by signal N (130 INT, 143 TERM); run stopped, work checkpointed, summary and record written |
 
 Non-zero exits leave the worktree in place, except a dispatch that fails before
 a session exists, which removes what it created. `.oc-worktrees/` and
@@ -322,11 +436,11 @@ It is the final reviewer's input.
 **`--merge`** merges the branch into the base it forked from with `--no-ff`.
 It refuses, with a specific reason, unless all of these hold: you are on the
 base branch with a clean tree; the latest *implement* run on the branch
-exited 0 and has a parseable `## RESULT` block; you passed
+finished, exited 0 and has a parseable `## RESULT` block; you passed
 `--verified "COMMAND"` (your attestation that you re-ran verification
 yourself — oc-task does not trust the model); every changed file is named
-in the `# Files` section of some brief dispatched to that branch; and there
-are no conflicts. The commit carries `oc-task-run:`, `model:`, `spec:`,
+in the `# Files` section of some brief dispatched to that branch, or of its
+`--continue-from` parent; and there are no conflicts. The commit carries `oc-task-run:`, `model:`, `spec:`,
 `branch:`, `session:`, `verified:` trailers. The branch is never deleted.
 
 The three merge modes exist because the six refusals above are a genuine
@@ -358,6 +472,12 @@ oc-models --verbose   add columns: context window, toolcall, reasoning, release 
 "Free" means the live catalog reports zero input and output cost. Nothing is
 hardcoded — Zen's free tier rotates. Ask Claude "what can you delegate to
 right now?" and it runs this.
+
+`oc-models` reads the catalog through a temporary file. opencode exits
+without draining its output, so a pipe whose reader is slower than opencode
+kept only the first ~50 KB of a ~600 KB catalog — the `jq: parse error:
+Unfinished string at EOF` that 0.4.0 printed above a partial list. A catalog
+that still does not parse now exits 3 and lists nothing.
 
 **When the default model disappears.** The skill checks `oc-models --free`
 once per plan. If `opencode/muse-spark-1.3-contributor-free` is gone Claude
@@ -407,6 +527,19 @@ Free-tier throttling mid-task is an expected condition, not a bug. oc-task
 exits 5 and Claude stops and tells you; it does not retry on its own. Wait,
 or pick another model from `oc-models --free` and resume with `--session ID`.
 
+A provider's refusal reaches oc-task through the run's own server log, not
+the run's event stream: the run itself just goes quiet. 0.4.0 waited out the
+idle timeout and called that a stall (exit 6), or sometimes exited with no
+summary at all. Now the summary's `limit:` line quotes the provider, and a
+`reset:` line gives the reset time when the provider names one. A usage cap
+exits at once; a rate limit after `rate_limit_grace` seconds without
+recovery. A run that produced no model output at all also exits 5: on the
+free tier that is almost always a limit.
+
+The limit is per account. Runs from other Claude sessions on the same
+machine share it, and oc-task's warning about other live runs on the model
+counts them.
+
 ### "stalled — no output for Ns" (exit 6)
 
 A run can stop producing output with no error at all: the assistant message
@@ -418,9 +551,53 @@ that has produced nothing for `--idle-timeout` seconds (default 420).
 Killing a run poisons its session (see below), so exit 6 also marks the session
 dead. The checkpoint commits in the worktree are the recovered work: write a
 continuation brief from the first incomplete step and dispatch it with
-`--session new --branch NAME`. Raise `--idle-timeout` for tasks with genuinely
-long silent stretches, or set `idle_timeout=0` in the config to disable the
-watchdog.
+`--session new --branch NAME --continue-from ORIGINAL_BRIEF`. Raise
+`--idle-timeout` for tasks with genuinely long silent stretches, or set
+`idle_timeout=0` in the config to disable the watchdog.
+
+Since 0.5.0 a stall is exit 6 only when the run had produced output and no
+provider error explains the silence; otherwise it is exit 5 (above).
+
+### "opencode's local database was busy" (exit 7)
+
+opencode keeps its sessions in one SQLite database
+(`~/.local/share/opencode/opencode.db`). Writers contend for it: several
+runs at once, a bulk `opencode session delete`, or a `VACUUM`. A run that
+loses shows `Failed to execute statement` under `errors:`. Nothing is wrong
+with the provider or the brief: wait for the other work to finish and
+re-dispatch `--session new`.
+
+### Killed by a signal (exit 128+N)
+
+Interrupting or killing `oc-task` (INT, TERM, HUP) stops the model's whole
+process tree, checkpoints whatever it left uncommitted, and still writes the
+summary and the run record. Resume with `--session ID`, or `--session new` if
+that exits 4. A SIGKILL cannot be caught: then the run record still says
+`"state": "running"`, the session id in it is good for a resume, and any
+`opencode` process it left behind shows in `ps`.
+
+### Disk usage
+
+opencode stores every event of every session in its database, and a long
+oc-task run can add gigabytes. oc-task warns when the database passes 5 GB
+(`$OC_DELEGATE_DB_WARN_GB` changes the threshold). To reclaim space, delete
+the sessions of runs you have merged — run records name them, and oc-task
+titles its sessions `oc-task RUNID` — with `opencode session delete ID`,
+then compact the database with no opencode run live:
+
+```
+sqlite3 ~/.local/share/opencode/opencode.db 'VACUUM;'
+```
+
+```
+sqlite3 ~/.local/share/opencode/opencode.db 'PRAGMA wal_checkpoint(TRUNCATE);'
+```
+
+The checkpoint matters: until it runs, the vacuumed copy sits in a
+`-wal` file as large as the database. Do not copy the database first on a
+nearly full disk — the copy plus the vacuum can fill it. Worktrees are the
+other large item: each carries its own `node_modules` once installed;
+remove merged ones with `git worktree remove`.
 
 ### "session poisoned — encrypted_content" (exit 4)
 
@@ -468,12 +645,21 @@ first if you're not sure which that is. For an older one, use the sha from
 
 ### Reading a failed run's log
 
-`.oc-runs/RUNID.log` is opencode's raw JSON event stream, one event per line:
+`.oc-runs/RUNID.log` is opencode's raw JSON event stream, one event per line,
+with opencode's own stderr mixed in. `jq -R 'fromjson?'` skips the lines that
+are not JSON; plain `jq` stops at the first one:
 
 ```
-jq -r 'select(.type=="text") | .part.text' .oc-runs/RUNID.log      # the model's prose
-jq -r 'select(.type=="error")' .oc-runs/RUNID.log                    # errors
-jq -r 'select(.type=="tool_use") | .part.tool' .oc-runs/RUNID.log    # tools called
+jq -rR 'fromjson? | select(.type=="text") | .part.text' .oc-runs/RUNID.log      # the model's prose
+jq -cR 'fromjson? | select(.type=="error")' .oc-runs/RUNID.log                  # errors
+jq -rR 'fromjson? | select(.type=="tool_use") | .part.tool' .oc-runs/RUNID.log  # tools called
+```
+
+An error event that says only "Unexpected server error. Check server logs
+for details." has its cause in `.oc-runs/RUNID.serve.log`:
+
+```
+grep 'level=ERROR' .oc-runs/RUNID.serve.log
 ```
 
 ## Layout
@@ -490,7 +676,11 @@ plugins/opencode-delegate/
     re-review-brief.md                               scoped re-review after a fix round
     final-reviewer-brief.md                          whole-branch review
     plan-template.md                                 fallback when superpowers:writing-plans is absent
+  tests/run.sh  tests/lib/                           offline suite; a stub stands in for opencode
   README.md
+docs/superpowers/specs/                              field reports the releases were built from
+docs/superpowers/plans/                              what each release changed for each finding
+CHANGELOG.md
 ```
 
 Dependencies: bash, git, opencode, jq, curl. Nothing else. No MCP server, no

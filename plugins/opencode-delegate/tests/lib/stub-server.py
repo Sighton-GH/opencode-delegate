@@ -7,22 +7,47 @@ Answers the two endpoints oc-task uses and records what it was sent:
                           OC_STUB_SESSION_STATUS, to exercise failed dispatch)
 
 The decoded `directory` query parameter of every POST /session is appended to
-$OC_STUB_STATE/session-directory, one per line. A repo path containing a space
-only survives that round trip if the client percent-encoded it.
+$OC_STUB_STATE/session-directory, one per line, and the request body to
+$OC_STUB_STATE/session-body. A repo path containing a space only survives
+that round trip if the client percent-encoded it.
+
+With OC_STUB_SERVE_ERROR set, the server logs that message to stderr in
+opencode's own format (`level=ERROR ... error.error="..."`), the way a real
+server reports a provider's refusal, OC_STUB_SERVE_ERROR_DELAY seconds
+(default 1) after the session is created.
 """
 import json
 import os
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
 STATE = os.environ.get("OC_STUB_STATE", ".")
 SESSION_STATUS = int(os.environ.get("OC_STUB_SESSION_STATUS", "200"))
+SERVE_ERROR = os.environ.get("OC_STUB_SERVE_ERROR", "")
+SERVE_ERROR_DELAY = float(os.environ.get("OC_STUB_SERVE_ERROR_DELAY", "1"))
+# With OC_STUB_SERVE_ERROR_SMALL set, the error comes from the title agent.
+SERVE_ERROR_SMALL = bool(os.environ.get("OC_STUB_SERVE_ERROR_SMALL"))
+SESSION_ID = "ses_stub0000000000000000"
 
 
 def record(name, value):
     with open(os.path.join(STATE, name), "a") as fh:
         fh.write(value + "\n")
+
+
+def log_error_later():
+    time.sleep(SERVE_ERROR_DELAY)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    sys.stderr.write(
+        'timestamp=%s level=ERROR run=stub message="stream error" providerID=opencode '
+        'modelID=stub session.id=%s small=%s agent=%s mode=primary error.error="%s"\n'
+        % (stamp, SESSION_ID, "true" if SERVE_ERROR_SMALL else "false",
+           "title" if SERVE_ERROR_SMALL else "build", SERVE_ERROR)
+    )
+    sys.stderr.flush()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -49,14 +74,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {})
             return
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        body = self.rfile.read(length).decode() if length else ""
+        record("session-body", body)
         directory = parse_qs(parsed.query).get("directory", [""])[0]
         record("session-directory", directory)
         if SESSION_STATUS != 200:
             self._send(SESSION_STATUS, {"error": "stub refused"})
             return
-        self._send(200, {"id": "ses_stub0000000000000000"})
+        if SERVE_ERROR:
+            threading.Thread(target=log_error_later, daemon=True).start()
+        self._send(200, {"id": SESSION_ID})
 
 
 def main():

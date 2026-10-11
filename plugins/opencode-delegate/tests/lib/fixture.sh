@@ -38,6 +38,9 @@ SHIM
 
   export OC_STUB_STATE="$FIX_STUB_STATE"
   export XDG_CONFIG_HOME="$FIX_ROOT/config"
+  # oc-task reads opencode's data directory (the database-size warning); the
+  # user's real one must never leak into a result.
+  export XDG_DATA_HOME="$FIX_ROOT/data"
 }
 
 fixture_cleanup() {
