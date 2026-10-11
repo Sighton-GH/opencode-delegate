@@ -5,14 +5,29 @@
 #
 #   OC_STUB_STATE            dir this stub records observations into (required)
 #   OC_STUB_SESSION_STATUS   HTTP status for POST /session (default 200)
+#   OC_STUB_SERVE_ERROR      an error message the stub server logs, as opencode
+#                            does, OC_STUB_SERVE_ERROR_DELAY seconds (default 1)
+#                            after the session is created
+#   OC_STUB_MODELS_PAD       extra catalog lines printed after the real ids
+#   OC_STUB_MODELS_VERBOSE   `models --verbose` output: ok (default) | truncated
 #   OC_STUB_RUN_MODE         what `opencode run` does (default: ok)
 #       ok        write a short event stream with a DONE RESULT block, create a
 #                 file in the worktree and commit it
 #       nochange  write the same event stream but touch nothing
-#       stall     write nothing at all and sleep until killed
+#       stall     write one event, then nothing, and sleep until killed
+#       silent    write nothing at all and sleep until killed
+#       slowok    write one event, wait OC_STUB_RUN_PAUSE seconds, then do `ok`
 #       poison    emit the provider's encrypted_content error
 #       fail      emit a generic error event and exit 1
 #       ratelimit emit a 429 error event and exit 1
+#       usage     emit a usage-limit error with a reset time and exit 1
+#       dbbusy    emit opencode's "Failed to execute statement" and exit 1
+#       errhang   emit an error event, then sleep until killed
+#       noisy     print a plain-text stderr line before the events, then `ok`
+#       dup       commit a file and emit a RESULT block with every line doubled
+#       needsctx  end with a NEEDS_CONTEXT status line but no RESULT heading
+#       stage     stage a file, leave a stale index.lock, emit DONE, exit 0
+#       ctrl      write and commit a file containing a raw control byte
 #   OC_STUB_RUN_SLEEP        seconds `run` sleeps before acting (default 0)
 set -uo pipefail
 
@@ -25,16 +40,39 @@ drain_stdin() { cat >"$state/last-prompt" 2>/dev/null || true; }
 
 emit() { printf '%s\n' "$1"; }
 
+RESULT_TEXT='## RESULT\nStatus: DONE\nFiles changed: stub-output.txt\nCommits: stub\nCommands run and their outcome: none\nCould not complete: nothing\nAssumptions made: none\nConcerns or questions: none\n'
+
+do_ok() { # $1 = worktree
+  printf 'stub wrote this\n' >>"$1/stub-output.txt"
+  git -C "$1" add -A >/dev/null 2>&1 || true
+  git -C "$1" -c user.name=stub -c user.email=stub@localhost \
+      commit -q -m "stub: implement the brief" >/dev/null 2>&1 || true
+  emit '{"type":"text","part":{"id":"prt_result","text":"'"$RESULT_TEXT"'"}}'
+}
+
 case "${1:-}" in
   models)
     # oc-task greps this for an exact match on the configured model id.
+    if [[ "${2:-}" == "--verbose" ]]; then
+      emit 'opencode/muse-spark-1.3-contributor-free'
+      emit '{"id":"muse-spark-1.3-contributor-free","providerID":"opencode","cost":{"input":0,"output":0},"limit":{"context":1048576},"capabilities":{"toolcall":true,"reasoning":true},"release_date":"2026-09-02"}'
+      emit 'opencode/paid-model'
+      if [[ "${OC_STUB_MODELS_VERBOSE:-ok}" == truncated ]]; then
+        printf '%s' '{"id":"paid-model","providerID":"opencode","cost":{"input":1,"outp'
+        exit 0
+      fi
+      emit '{"id":"paid-model","providerID":"opencode","cost":{"input":1,"output":2},"limit":{"context":200000},"capabilities":{"toolcall":true,"reasoning":false},"release_date":"2026-01-01"}'
+      exit 0
+    fi
     emit 'opencode/muse-spark-1.3-contributor-free'
     emit 'opencode/stub-alternate-free'
+    for (( i = 0; i < ${OC_STUB_MODELS_PAD:-0}; i++ )); do emit "pad/model-$i"; done
     exit 0
     ;;
 
   serve)
     port=""
+    printf '%s\n' "$*" >"$state/serve-args"
     while [[ $# -gt 0 ]]; do
       case "$1" in --port) port="${2:-}"; shift 2 ;; *) shift ;; esac
     done
@@ -51,8 +89,22 @@ case "${1:-}" in
     sleep "${OC_STUB_RUN_SLEEP:-0}"
     case "${OC_STUB_RUN_MODE:-ok}" in
       stall)
-        # The process is alive, the log never grows, no error is ever emitted.
+        # One event, then the process stays alive, the log never grows, and
+        # no error is ever emitted.
+        emit '{"type":"step_start","part":{"id":"prt_step"}}'
         sleep 3600
+        exit 0
+        ;;
+      silent)
+        # Not a single event: what a run refused by its provider looks like.
+        sleep 3600
+        exit 0
+        ;;
+      slowok)
+        emit '{"type":"step_start","part":{"id":"prt_step"}}'
+        sleep "${OC_STUB_RUN_PAUSE:-3}"
+        emit '{"type":"step_start","part":{"id":"prt_step2"}}'
+        do_ok "$dir"
         exit 0
         ;;
       poison)
@@ -63,6 +115,19 @@ case "${1:-}" in
         emit '{"type":"error","error":{"name":"APIError","data":{"message":"429 Too Many Requests: rate limit exceeded"}}}'
         exit 1
         ;;
+      usage)
+        emit '{"type":"error","error":{"name":"APIError","data":{"message":"AI_APICallError: Usage limit reached. Resets in 3h 51m."}}}'
+        exit 1
+        ;;
+      dbbusy)
+        emit '{"type":"error","error":{"name":"UnknownError","data":{"message":"Failed to execute statement"}}}'
+        exit 1
+        ;;
+      errhang)
+        emit '{"type":"error","error":{"code":"ECONNRESET","path":"http://127.0.0.1:1/session/x/message"}}'
+        sleep 3600
+        exit 0
+        ;;
       fail)
         emit '{"type":"error","error":{"name":"APIError","data":{"message":"stub failure"}}}'
         exit 1
@@ -71,12 +136,41 @@ case "${1:-}" in
         emit '{"type":"text","part":{"text":"## RESULT\nStatus: DONE\nFiles changed: none\n"}}'
         exit 0
         ;;
-      ok|*)
+      noisy)
+        echo "Warning: something opencode printed to stderr" >&2
+        do_ok "$dir"
+        exit 0
+        ;;
+      dup)
+        # Every line of the block twice, as one model emitted it (field
+        # report v0.4.0 #9).
         printf 'stub wrote this\n' >>"$dir/stub-output.txt"
         git -C "$dir" add -A >/dev/null 2>&1 || true
+        git -C "$dir" -c user.name=stub -c user.email=stub@localhost commit -q -m "stub" >/dev/null 2>&1 || true
+        emit '{"type":"text","part":{"id":"prt_result","text":"## RESULT\n## RESULT\nStatus: DONE\nStatus: DONE\nFiles changed: stub-output.txt\nFiles changed: stub-output.txt\n"}}'
+        exit 0
+        ;;
+      needsctx)
+        emit '{"type":"text","part":{"id":"prt_q","text":"I read the brief.\nStatus: NEEDS_CONTEXT — which config file should the flag go in?\n"}}'
+        exit 0
+        ;;
+      stage)
+        printf 'staged but never committed\n' >"$dir/staged.txt"
+        git -C "$dir" add staged.txt >/dev/null 2>&1 || true
+        : >"$(git -C "$dir" rev-parse --git-dir)/index.lock"
+        emit '{"type":"text","part":{"id":"prt_result","text":"'"$RESULT_TEXT"'"}}'
+        exit 0
+        ;;
+      ctrl)
+        printf 'const re = /[\001]/;\n' >"$dir/stub-output.txt"
+        git -C "$dir" add -A >/dev/null 2>&1 || true
         git -C "$dir" -c user.name=stub -c user.email=stub@localhost \
-            commit -q -m "stub: implement the brief" >/dev/null 2>&1 || true
-        emit '{"type":"text","part":{"text":"## RESULT\nStatus: DONE\nFiles changed: stub-output.txt\nCommits: stub\nCommands run and their outcome: none\nCould not complete: nothing\nAssumptions made: none\nConcerns or questions: none\n"}}'
+            commit -q -m "stub: a control byte" >/dev/null 2>&1 || true
+        emit '{"type":"text","part":{"id":"prt_result","text":"'"$RESULT_TEXT"'"}}'
+        exit 0
+        ;;
+      ok|*)
+        do_ok "$dir"
         exit 0
         ;;
     esac

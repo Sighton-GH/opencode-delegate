@@ -70,8 +70,9 @@ Check your available skills list once at the start:
 Three commands are on your PATH; `oc-task --help` has the exit codes.
 
 ```
-oc-task --brief PATH [--role implement|review] [--model M] [--branch B] [--session ID|new]
-        [--idle-timeout S] [--copy-untracked PATH]... [--no-link-node-modules]
+oc-task --brief PATH [--role implement|review] [--model M] [--branch B] [--base REF]
+        [--session ID|new] [--continue-from PARENT_BRIEF] [--idle-timeout S]
+        [--copy-untracked PATH]... [--install | --no-link-node-modules] [--dry-run]
 oc-task --branch-diff --branch B
 oc-task --merge --branch B --verified "COMMAND" [-m MSG | --no-commit | --squash]
 oc-models --free [--verbose]
@@ -82,9 +83,20 @@ oc-undo [--list]
   Every later task in the same plan is `--session new --branch B`: a fresh
   session, the same worktree. Fix rounds resume with `--session ID`.
 - Every run prints a compact summary — session id, exit, duration, files
-  changed, the model's `## RESULT` block — and writes `.oc-runs/RUNID.diff`
-  (that run's changes, with commit list and 10 lines of context: the review
-  package) and `.oc-runs/RUNID.log` (raw event stream; read only on failure).
+  changed, `warning:` and `errors:` lines, the model's `## RESULT` block —
+  and writes `.oc-runs/RUNID.diff` (that run's changes, with commit list and
+  10 lines of context: the review package), `.oc-runs/RUNID.log` (raw event
+  stream) and `.oc-runs/RUNID.serve.log` (the run's own server log, where a
+  provider's refusal is written). Read the logs only on failure.
+- The summary is also saved as `.oc-runs/RUNID.summary`, and the run record
+  `.oc-runs/RUNID.json` exists from the moment of dispatch (`state: running`
+  until it ends). A wrapper that is killed, or that fails inside itself,
+  still writes both. Never pipe `oc-task` through `tail` or `head`: the
+  summary is short, and a pipe can hide the exit code.
+- One run per worktree: `oc-task` refuses a dispatch into a worktree where
+  another run is live, because a review's cleanup resets the worktree it ran
+  in. Runs on separate branches can overlap, but they share the provider's
+  per-account limit; `oc-task` warns when other live runs use the same model.
 - `--role review` runs opencode's read-only `plan` agent: it can read, grep,
   and run commands but cannot edit. Its `## RESULT` is the verdict.
 - Run `oc-task` with the Bash tool's maximum timeout (600000 ms). If the
@@ -126,8 +138,15 @@ the choice in the ledger.
     recollection.
  4. If the task's inputs are untracked files the user just added, dispatch
     Task 1 with `--copy-untracked <path>` for each, because the worktree
-    forks from `HEAD` and will not contain them otherwise; `node_modules`
-    is linked automatically.
+    forks from `HEAD` and will not contain them otherwise. Dependencies:
+    by default the worktree gets its own `node_modules` directory linked
+    entry by entry to the base checkout's (nested workspace installs too),
+    with workspace packages resolving to the worktree's own copies. Dispatch
+    Task 1 with `--install` instead when the plan changes dependencies or
+    adds a workspace package, or when the base checkout has no
+    `node_modules` (`oc-task` warns). A task that depends on an unmerged
+    sibling branch starts from it with `--base oc/<sibling>`; merge the
+    sibling first, or the merge audit sees its files too.
  5. Read the plan once. Create a todo per task. Scan for conflicts before
     Task 1 — one row per pair of tasks sharing a file or interface, one row
     per task for internal consistency — write the table to the ledger, rule
@@ -141,7 +160,9 @@ the choice in the ledger.
 edit across files → one brief listing every file and its change, one run,
 one review.
 
-**Never run two implement sessions in parallel** on the same branch.
+**Never run two sessions at once on the same branch** — implement or
+review. `oc-task` refuses the second; write the next brief while a run is
+in flight instead.
 
 ### 1. Dispatch the implementer
 
@@ -172,30 +193,48 @@ Read the summary's `## RESULT` block. Its `Status:` line is one of:
 - **DONE_WITH_CONCERNS** → read the concerns. Correctness or scope concerns:
   resolve them (a ruling, or a fix round with the resolution) before review.
   Observations: note in the ledger, review.
-- **NEEDS_CONTEXT** → answer in a short follow-up brief (all required
-  sections, each can be one line) and resume: `--session ID`.
+- **NEEDS_CONTEXT** → answer in a short follow-up brief and resume:
+  `--session ID --continue-from <original brief>` (the follow-up then needs
+  only the sections it changes; without the flag, every required section,
+  each can be one line).
 - **BLOCKED** → context problem: supply it and resume. Task too large: split
   it into two briefs. Plan wrong: rule, ledger it, resume with the ruling.
   Never resume with nothing changed.
 
-Non-zero exits: **1** read the `errors:` lines (only then the `.log`), fix
-the cause, resume or re-dispatch. **3** (zero changes) with a DONE status is
-a brief problem — the model thought it was done; tighten and resume. **4**
-(image limit or a poisoned reasoning state) the session is dead: write a
-continuation brief from the first incomplete numbered task and dispatch
-`--session new --branch B`; the checkpoint commits are kept. **5** (rate
-limit) stop and tell the user; do not retry on your own. **6** (stalled) the
-run produced no output for the idle timeout and was killed; the session is
-dead. Treat it exactly like 4: continuation brief from the first incomplete
-step, `--session new --branch B`. If the task legitimately has long silent
-stretches, re-dispatch with a larger `--idle-timeout`.
+Non-zero exits: **1** read the `errors:` lines — `server:` lines come from
+the run's own opencode server — and only then the logs; fix the cause,
+resume or re-dispatch. **3** (zero changes) with a DONE status is a brief
+problem — the model thought it was done; tighten and resume. A 3 whose exit
+line says the model stopped with NEEDS_CONTEXT or BLOCKED is that status:
+handle it as above. **4** (image limit or a poisoned reasoning state) the
+session is dead: write a continuation brief and dispatch `--session new
+--branch B --continue-from <original brief>`; the checkpoint commits are
+kept. **5** (rate or usage limit, or a run that produced no model output at
+all) stop and tell the user, quoting the `limit:` and `reset:` lines; do not
+retry on your own. After the reset, resume with `--session ID` (if that
+exits 4, use `--session new`). **6** (stalled) the run produced output, then
+nothing for the idle timeout, and was killed; the session is dead. Treat it
+exactly like 4. If the task legitimately has long silent stretches,
+re-dispatch with a larger `--idle-timeout`. **7** opencode's own database
+was busy (another opencode run, a bulk `opencode session delete`, a
+`VACUUM`): wait for that to finish, then re-dispatch `--session new`.
+**128+N** the wrapper was killed by a signal (143 = TERM); the summary,
+record and checkpoint were still written — resume as for 4.
+
+Read every `warning:` line. "checkpoint failed" means the run's last work is
+still uncommitted in the worktree — commit it there before the next
+dispatch. "gained raw control bytes" or "diffs as binary" on a source file
+is a finding for the review.
 
 ### 3. Review the task
 
 Re-run the task's verification command yourself inside the worktree
 (`.oc-worktrees/<branch>`) before anything else — cheap, and it catches a
 report that overstates. If it fails, that is a finding; go to the fix loop
-without a review dispatch.
+without a review dispatch. Run it with the worktree as the working
+directory: a formatter or linter run from your own checkout against
+`.oc-worktrees/...` paths may skip them silently, because ignore files
+(`.prettierignore`, `.eslintignore`) commonly list `.oc-worktrees`.
 
 Then write `.oc-runs/<plan-slug>/task-N-review-brief.md` from
 `${CLAUDE_PLUGIN_ROOT}/skills/opencode-driven-development/task-reviewer-brief.md`
@@ -209,6 +248,10 @@ Dispatch:
 ```
 oc-task --brief .oc-runs/<plan-slug>/task-N-review-brief.md --role review --branch oc/<plan-slug> --session new
 ```
+
+To review a branch another tool made (not an `oc/` branch), fork a fresh
+review branch from it: `--role review --base <that branch>` (no
+`--session`), so the reviewer's checkout holds the code under review.
 
 The reviewer returns `Spec: PASS|FAIL`, `Quality: APPROVED|NEEDS_WORK`,
 findings with severity, and `Cannot verify` items. Resolve each

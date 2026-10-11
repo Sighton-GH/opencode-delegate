@@ -3,34 +3,55 @@
 # capture everything, and print only a compact summary.
 #
 #   oc-task --brief <path> [--role implement|review] [--model <provider/model>]
-#           [--branch <name>] [--session <id>|new] [--dry-run]
+#           [--branch <name>] [--base <ref>] [--session <id>|new]
+#           [--continue-from <parent brief>] [--idle-timeout <seconds>]
+#           [--copy-untracked <path>]...
+#           [--install | --link-node-modules | --no-link-node-modules]
+#           [--dry-run]
 #   oc-task --branch-diff --branch <name>
 #   oc-task --merge (--branch <name> | --session <id>) --verified "<command>"
+#           [-m|--message <subject> | --no-commit | --squash]
 #
 # Roles: implement (default) edits, commits, and gets a per-run diff; review
 # runs opencode's read-only `plan` agent and may not change files.
+# --base forks a new branch from <ref> instead of HEAD. --continue-from lets a
+# continuation brief inherit every section it does not repeat from its parent.
+# --dry-run validates the brief (naming every missing section) and the plan.
 # Model precedence: --model > $OC_DELEGATE_MODEL > config `model=` > built-in.
 # Config: ${XDG_CONFIG_HOME:-~/.config}/oc-delegate/config (created on first run).
+# Every run writes .oc-runs/RUNID.{json,log,serve.log,diff,summary}; the
+# .json record exists from the moment the run is dispatched.
 #
 # Exit codes
 #   0  success, changes produced
-#   1  opencode errored (generic) / setup failure
+#   1  opencode errored (generic) / setup failure / oc-task internal error
 #   2  spec rejected — missing or malformed
 #   3  completed but zero changes
-#   4  session poisoned by image limit — unrecoverable
-#   5  rate limited by the provider
+#   4  session poisoned (image limit or encrypted_content) — unrecoverable
+#   5  rate or usage limited by the provider, or no model output at all
 #   6  stalled — no output for the idle timeout; the session is dead
+#   7  opencode's local database was busy — retry once other opencode work ends
+#   128+N  killed by signal N (130 INT, 143 TERM); summary and record still written
 set -euo pipefail
 
 # Built-in default. Resolved from the live catalog (`opencode models --verbose`,
 # cost 0/0, name "Muse Spark 1.3 Free") on 2026-09-12. Override rather than edit.
 DEFAULT_MODEL="opencode/muse-spark-1.3-contributor-free"
 # How long a run may produce no output at all before the watchdog kills it.
-# The provider's *explicit* rate limit surfaces as an error and exits 5; the
-# silent one just stops emitting, with no error and no end of turn, and used to
-# hang until an operator noticed (field report #4). 0 disables the watchdog.
+# 0 disables the watchdog.
 DEFAULT_IDLE_TIMEOUT=420
-IDLE_POLL=5
+# A provider rate limit arrives in the server's log while the run itself just
+# goes quiet; waiting out the idle timeout turned every one into a 7-to-20
+# minute "stall" (field report v0.4.0 #1, #15, #19). opencode sometimes retries
+# and recovers, so give it this long, then stop the run and exit 5.
+DEFAULT_RATE_LIMIT_GRACE=90
+# A run that has written an error event and then goes quiet is finished in all
+# but name: an attach ECONNRESET once left one waiting 13 minutes.
+ERROR_GRACE="${OC_DELEGATE_ERROR_GRACE:-60}"
+# Seconds between watchdog checks. Only the test suite needs to change it.
+IDLE_POLL="${OC_TASK_POLL:-5}"
+# opencode keeps every event of every session; past this size, say so.
+DB_WARN_GB="${OC_DELEGATE_DB_WARN_GB:-5}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/oc-delegate"
 CONFIG_FILE="$CONFIG_DIR/config"
 IMPLEMENT_SECTIONS=("Objective" "Files" "Tasks" "Verification" "Definition of done" "Required output")
@@ -42,17 +63,27 @@ MERGE_MARKER="oc-task-run:"
 # Error classification. The image-limit phrase is opencode's own (issues #48647,
 # #39677); it is not a context overflow, so opencode never auto-recovers from it.
 IMAGE_LIMIT_RE='exceeding the maximum of[^"]*images'
-RATE_LIMIT_RE='rate[ _-]?limit|too many requests|status(code)?[^0-9]*429|"429"|quota (exceeded|reached)|overloaded|capacity'
+RATE_LIMIT_RE='rate[ _-]?limit|usage limit|too many requests|status(code)?[^0-9]*429|"429"|quota (exceeded|reached)|overloaded|capacity'
+# Limits that will not lift while a run waits. These stop the run at once.
+HARD_LIMIT_RE='usage limit|quota (exceeded|reached)'
+# Where a provider says when to come back ("Resets in 3h 51m").
+RESET_RE='resets? (in|at) [^".]+|retry after [^".]+|try again in [^".]+'
+# opencode's own SQLite store, contended by concurrent writers (another run, or
+# a bulk `opencode session delete`). Transient, and not the provider's fault.
+DB_BUSY_RE='failed to execute statement|database is locked|sqlite_busy'
 # A session whose turn was interrupted — killed, or dropped mid-stream — loses
 # the reasoning state the provider expects back on the next turn, and every
 # subsequent turn fails instantly. Like the image limit it is unrecoverable,
 # so it gets the same treatment: mark the session dead and never retry it.
 POISON_RE='encrypted_content'
+# Text files whose diff should never be binary. A NUL written where an escape
+# sequence was meant (field report v0.4.0 #17) turns one into a binary diff.
+TEXT_EXT_RE='\.(ts|tsx|js|jsx|mjs|cjs|json|md|py|sh|bash|go|rs|java|kt|rb|php|c|h|cc|cpp|hpp|cs|swift|css|scss|html|vue|svelte|yml|yaml|toml|ini|txt|sql)$'
 
-EX_OK=0; EX_ERR=1; EX_SPEC=2; EX_NOCHANGE=3; EX_IMAGES=4; EX_RATE=5; EX_STALL=6
+EX_OK=0; EX_ERR=1; EX_SPEC=2; EX_NOCHANGE=3; EX_IMAGES=4; EX_RATE=5; EX_STALL=6; EX_DBBUSY=7
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
-die()   { local code=$1; shift; echo "oc-task: $*" >&2; exit "$code"; }
+usage() { awk 'NR == 1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; }
+die()   { local code=$1; shift; died=1; echo "oc-task: $*" >&2; exit "$code"; }
 
 # Latest run record matching a jq filter, or empty.
 find_run() { # $1 = jq select expression
@@ -69,26 +100,45 @@ fmt_duration() { local s=$1; printf '%dm%02ds' $((s/60)) $((s%60)); }
 
 # Extract the paths a spec's `# Files` section names. Any token containing `/`
 # or `.`, with quoting/punctuation stripped. Directories end in `/`; globs pass
-# through so `[[ path == token ]]` can match them.
+# through so `[[ path == token ]]` can match them. A bare filename after a full
+# path on the same line ("`src/pages/a.tsx`, `b.tsx`") also yields that path's
+# directory plus the name, because that is what the brief's author meant
+# (field report v0.4.0 #23).
 # Naming no files is a valid answer, not an error: a `--role review` brief has
-# no `# Files` section at all. Without the `|| true` the grep chain exits
-# non-zero for such a brief, and under `set -e` that aborts whatever loop the
-# caller is building its union in, silently truncating it.
+# no `# Files` section at all. Without the `|| true` the chain exits non-zero
+# for such a brief, and under `set -e` that aborts whatever loop the caller is
+# building its union in, silently truncating it.
 spec_file_tokens() {
-  awk 'tolower($0) ~ /^#+[[:space:]]*files[[:space:]]*$/ {f=1; next} /^#+[[:space:]]/ {f=0} f' "$1" \
-    | grep -oE '[A-Za-z0-9_@./*?~-]+' | grep -E '[/.]' | sed -E 's/^[.]+$//; s/[.,;:]+$//' | grep -v '^$' | sort -u \
-    || true
+  awk '
+    tolower($0) ~ /^#+[[:space:]]*files[[:space:]]*$/ {f = 1; next}
+    /^#+[[:space:]]/ {f = 0}
+    f {
+      dir = ""; line = $0
+      while (match(line, /[A-Za-z0-9_@.\/*?~-]+/)) {
+        t = substr(line, RSTART, RLENGTH); line = substr(line, RSTART + RLENGTH)
+        if (t !~ /[\/.]/) continue
+        sub(/[.,;:]+$/, "", t); sub(/^\.\//, "", t)
+        if (t == "" || t ~ /^[.]+$/) continue
+        print t
+        if (t ~ /\//) { d = t; if (d !~ /\/$/) sub(/[^\/]*$/, "", d); dir = d }
+        else if (dir != "") print dir t
+      }
+    }' "$1" | sort -u || true
 }
 
 check_spec() { # prints missing sections, one per line; returns 0 if none
-  local missing=0 s
+  local missing=0 s re
   [[ -n "$spec" ]]       || { echo "no --spec given"; return 1; }
   [[ -f "$spec" ]]       || { echo "spec not found: $spec"; return 1; }
   [[ -s "$spec" ]]       || { echo "spec is empty: $spec"; return 1; }
+  if [[ -n "$parent_spec" ]]; then
+    [[ -f "$parent_spec" ]] || { echo "parent brief not found: $parent_spec"; return 1; }
+  fi
   for s in "${REQUIRED_SECTIONS[@]}"; do
-    if ! grep -qiE "^#+[[:space:]]*${s}[[:space:]]*$" "$spec"; then
-      echo "missing section: # $s"; missing=1
-    fi
+    re="^#+[[:space:]]*${s}[[:space:]]*$"
+    if grep -qiE "$re" "$spec"; then continue; fi
+    if [[ -n "$parent_spec" ]] && grep -qiE "$re" "$parent_spec"; then continue; fi
+    echo "missing section: # $s"; missing=1
   done
   return $missing
 }
@@ -100,44 +150,129 @@ check_spec() { # prints missing sections, one per line; returns 0 if none
 # already a hard dependency, so this costs nothing.
 uri_escape() { jq -rn --arg s "${1-}" '$s|@uri'; }
 
+# The model's text from a run log, each part once and in order. Parsed line by
+# line: opencode's stderr shares the log, and one plain-text line used to stop
+# jq dead, dropping every event after it — the RESULT block and the errors
+# with it. A part streamed more than once keeps its last version (field report
+# v0.4.0 #9).
+run_text() { # $1 = run log
+  jq -Rrs '[split("\n")[] | fromjson? | select(type == "object" and .type == "text")]
+    | reduce .[] as $e ({order: [], parts: {}};
+        ($e.part.id // ("#" + (.order | length | tostring))) as $id
+        | (if (.parts | has($id)) then . else .order += [$id] end)
+        | .parts[$id] = ($e.part.text // ""))
+    | .order[] as $id | .parts[$id]' "$1" 2>/dev/null || true
+}
+
+# Error events in a run log, one message per line, at most five.
+run_errors() { # $1 = run log
+  jq -Rr 'fromjson? | select(type == "object" and .type == "error")
+    | (.error.name // .error.code // "error") + ": "
+      + ((.error.data.message // .error.message
+          // (if .error.data then (.error.data | tostring) else null end)
+          // (.error | tostring)) | tostring)
+      + (if .error.data.ref then " (server ref " + .error.data.ref + ")" else "" end)' "$1" 2>/dev/null \
+    | awk '!seen[$0]++' | head -5 || true
+}
+
+# How many events the model produced: everything but errors and our own notes.
+model_event_count() { # $1 = run log
+  jq -Rr 'fromjson? | select(type == "object") | .type // empty' "$1" 2>/dev/null \
+    | grep -cvxE 'error|oc-task' || true
+}
+
+# Error messages from this run's own `opencode serve` log. The server is
+# started per run, so every line in it is this run's. Only complete lines are
+# read, so a line caught half-written is picked up whole on the next look.
+# Provider errors land here and nowhere else: the run's own event stream says
+# at most "Unexpected server error. Check server logs for details." (field
+# report v0.4.0 #3, #10, #21). Errors from opencode's own small-model calls
+# (`small=true`, the session-title agent) say nothing about the run's model
+# and are left out: a title request refused for want of a payment method must
+# not end a healthy run as rate limited.
+serve_errors() { # $1 = serve log
+  local f=$1
+  [[ -s "$f" ]] || return 0
+  { if [[ -z "$(tail -c1 "$f")" ]]; then cat "$f"; else sed '$d' "$f"; fi; } \
+    | grep -F 'level=ERROR' \
+    | grep -vE 'message="share subscriber failed"|Failed to fetch models\.dev|small=true' \
+    | sed -E -e 's/.*error\.error="([^"]*)".*/\1/' -e 't' \
+             -e 's/.* error="([^"]*)".*/\1/' -e 't' \
+             -e 's/.*message="([^"]*)".*/\1/' -e 't' \
+             -e 's/.*message=([^ ]*).*/\1/' \
+    || true
+}
+
+limit_reset() { grep -oiE "$RESET_RE" <<<"${1-}" | tail -1 || true; }
+
+# A RESULT block in which every line after the heading appears twice in a row
+# is one block, not two: a model emitted exactly that (field report v0.4.0 #9).
+# Anything less regular is printed as written.
+dedouble_result() {
+  awk '{ l[NR] = $0 }
+    END {
+      h = (NR > 0 && l[1] ~ /^## RESULT/) ? 1 : 0; n = NR - h; d = (n > 0 && n % 2 == 0)
+      for (i = h + 1; d && i <= NR; i += 2) if (l[i] != l[i + 1]) d = 0
+      for (i = 1; i <= NR; i++) if (!d || i <= h || (i - h) % 2 == 1) print l[i]
+    }'
+}
+
+# Files whose added lines carry raw control bytes, which is what a model's
+# edit tool leaves when it decodes `\u0000`-style escapes a second time (field
+# report v0.4.0 #17). Tab, CR and LF are fine.
+control_byte_files() { # $1 $2 = commit range
+  local f n
+  while IFS= read -r f; do
+    n=$(git diff -U0 "$1" "$2" -- "$f" 2>/dev/null \
+          | LC_ALL=C sed -n -e '/^+++ /d' -e '/^+/p' \
+          | LC_ALL=C tr -d '\t\r\n\040-\176\200-\377' | wc -c | tr -d ' ')
+    [[ "${n:-0}" -gt 0 ]] && printf '%s\n' "$f"
+  done < <(git diff --name-only --diff-filter=AM "$1" "$2" 2>/dev/null)
+  return 0
+}
+
 # A dispatch that dies after the worktree exists but before a run record is
 # written leaves a branch and a worktree that every recovery path then refuses
 # — there is no record to resume from, and a fresh dispatch refuses because the
 # worktree exists (field report #2). Undo exactly what this invocation created
-# so the operator can simply dispatch again.
+# so the operator can simply dispatch again. A branch that existed before this
+# invocation is never deleted.
 discard_new_worktree() {
   [[ "${created_wt:-0}" -eq 1 ]] || return 0
   created_wt=0
   if [[ -n "${serve_pid:-}" ]]; then
-    kill "$serve_pid" 2>/dev/null || true
+    kill_tree "$serve_pid"
     wait "$serve_pid" 2>/dev/null || true
     serve_pid=""
   fi
+  release_lock
   git worktree remove --force "$worktree" >/dev/null 2>&1 || rm -rf "$worktree"
   git worktree prune >/dev/null 2>&1 || true
-  git branch -D "$branch" >/dev/null 2>&1 || true
+  [[ "${created_branch:-0}" -eq 1 ]] && { git branch -D "$branch" >/dev/null 2>&1 || true; }
   return 0
 }
 
 # die(), but first undo a worktree this invocation created.
 die_fresh() { discard_new_worktree; die "$@"; }
 
-# Kill the run and everything it spawned. `set -m` when launching made the
-# child a process-group leader, so the negative pid reaches opencode's whole
-# tree; without that, killing the wrapper left the run alive and committing
-# while its server died with the parent (field report #8).
-kill_run() {
-  local pid="${run_pid:-}"
+# Kill a process group and everything in it. `set -m` when launching made the
+# child a process-group leader, so the negative pid reaches its whole tree;
+# without that, killing the wrapper left the run alive and committing while
+# its server died with the parent (field report #8).
+kill_tree() { # $1 = pid of a process-group leader
+  local pid="${1:-}" i
   [[ -n "$pid" ]] || return 0
   kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-  local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
     kill -0 "$pid" 2>/dev/null || return 0
+    # A child that has exited but not been reaped still answers kill -0.
+    [[ "$(ps -o stat= -p "$pid" 2>/dev/null)" == Z* ]] && return 0
     sleep 0.5
   done
   kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
   return 0
 }
+kill_run() { kill_tree "${run_pid:-}"; }
 
 # Where a worktree's provisioning list lives. It goes in the worktree's own git
 # dir, which `git rev-parse --git-dir` reports as an absolute path for a linked
@@ -163,14 +298,140 @@ provision_pathspec() {
   return 0
 }
 
+# Give the worktree its own node_modules directory whose entries point at the
+# base checkout's packages: no install and no network, yet isolated. A symlink
+# to the whole directory (v0.4.0) made the base checkout writable from the
+# worktree — an `npm ci` there emptied it (field report v0.4.0 #37) — and
+# resolved every workspace package to the base checkout's copy, so cross-
+# package typechecks read the wrong code (#7). With a real directory, npm
+# replaces a linked entry instead of writing through it (checked against
+# `npm ci` and `npm install`), and a relative workspace link copied verbatim
+# resolves inside the worktree. Scope directories and `.bin` are rebuilt one
+# level down for the same reason. Per-checkout tool caches are left out.
+link_nm_dir() { # $1 = source node_modules dir, $2 = destination (created)
+  local src=$1 dst=$2 e name raw
+  mkdir -p "$dst" || return 1
+  for e in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+    [[ -e "$e" || -L "$e" ]] || continue
+    name=${e##*/}
+    case "$name" in .cache|.vite|.vite-temp) continue ;; esac
+    if [[ -d "$e" && ! -L "$e" && ( "$name" == @* || "$name" == .bin ) ]]; then
+      link_nm_dir "$e" "$dst/$name" || return 1
+      continue
+    fi
+    if [[ -L "$e" ]]; then
+      raw=$(readlink "$e")
+      # A relative link that also resolves from the worktree (a workspace
+      # package, a .bin entry) keeps its target, so it resolves here.
+      if [[ "$raw" != /* && -e "$dst/$raw" ]]; then ln -s "$raw" "$dst/$name" || return 1; continue; fi
+      # An absolute link into the base checkout's own tree, outside any
+      # node_modules, is a workspace package: point it at the worktree's copy.
+      if [[ "$raw" == "$repo_root"/* && "$raw" != */node_modules/* && -e "$worktree/${raw#"$repo_root"/}" ]]; then
+        ln -s "$worktree/${raw#"$repo_root"/}" "$dst/$name" || return 1; continue
+      fi
+    fi
+    ln -s "$e" "$dst/$name" || return 1
+  done
+}
+
+# Workspace directories (a tracked package.json below the root) that have an
+# install of their own in the base checkout, which the worktree also needs
+# (evaluation D52: `packages/dashboard/node_modules`).
+nested_nm_dirs() {
+  local p d
+  git -C "$repo_root" ls-files -- '*/package.json' 2>/dev/null | while IFS= read -r p; do
+    d=${p%/package.json}
+    [[ -d "$repo_root/$d/node_modules" && -d "$worktree/$d" && ! -e "$worktree/$d/node_modules" ]] && printf '%s\n' "$d"
+  done
+  return 0
+}
+
+# The project's own clean install, run inside the worktree (--install).
+install_deps() { # returns 2 when there is no lockfile, 3 when the tool is missing
+  local cmd=()
+  if   [[ -f "$worktree/package-lock.json" || -f "$worktree/npm-shrinkwrap.json" ]]; then cmd=(npm ci --no-audit --no-fund)
+  elif [[ -f "$worktree/pnpm-lock.yaml" ]]; then cmd=(pnpm install --frozen-lockfile)
+  elif [[ -f "$worktree/yarn.lock" ]];      then cmd=(yarn install --frozen-lockfile)
+  elif [[ -f "$worktree/bun.lock" || -f "$worktree/bun.lockb" ]]; then cmd=(bun install --frozen-lockfile)
+  else return 2; fi
+  command -v "${cmd[0]}" >/dev/null 2>&1 || return 3
+  echo "oc-task: running ${cmd[*]} in the worktree (log $RUNS_DIR/$run_id.install.log)" >&2
+  ( cd "$worktree" && "${cmd[@]}" </dev/null >"$install_log" 2>&1 )
+}
+
+# One live oc-task per worktree. A review's cleanup resets the worktree it
+# ran in, so a review started beside a live implement run discarded that
+# run's uncommitted work.
+lock_file() { local g; g=$(git -C "$worktree" rev-parse --git-dir 2>/dev/null) || return 1; printf '%s/oc-task.lock' "$g"; }
+live_lock() { # prints "pid run_id" of another live oc-task holding the worktree
+  local f pid rid
+  f=$(lock_file) || return 0
+  [[ -f "$f" ]] || return 0
+  read -r pid rid < "$f" || return 0
+  [[ -n "$pid" && "$pid" != "$$" ]] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  ps -o args= -p "$pid" 2>/dev/null | grep -q 'oc-task' || return 0
+  printf '%s %s\n' "$pid" "${rid:-?}"
+}
+# Taken with noclobber, so of two dispatches started together exactly one
+# gets the worktree. A lock left by a dead wrapper is replaced.
+lock_busy_msg() { printf 'another oc-task run is live in %s (%s). One run per worktree: a review'"'"'s cleanup would discard a live implementer'"'"'s work. Wait for it to finish.' "$WORKTREES_DIR/$branch" "$1"; }
+write_lock() { ( set -o noclobber; printf '%s %s\n' "$$" "$run_id" > "$1" ) 2>/dev/null; }
+acquire_lock() {
+  local f held
+  f=$(lock_file) || return 0
+  if ! write_lock "$f"; then
+    held=$(live_lock)
+    [[ -z "$held" ]] || die "$EX_ERR" "$(lock_busy_msg "pid ${held%% *}, run ${held#* }")"
+    rm -f "$f"
+    write_lock "$f" || die "$EX_ERR" "$(lock_busy_msg "it was taken a moment ago")"
+  fi
+  lock_taken=1
+}
+release_lock() {
+  [[ "${lock_taken:-0}" -eq 1 ]] || return 0
+  local f pid; f=$(lock_file) || return 0
+  read -r pid _ < "$f" 2>/dev/null || true
+  [[ "${pid:-}" == "$$" ]] && rm -f "$f"
+  lock_taken=0; return 0
+}
+
+# Other live `opencode run` processes on the same model. Free tiers limit per
+# account, not per run, so these share this run's limit — across every job on
+# the machine (field report v0.4.0 #5, #32).
+other_runs_on_model() {
+  ps -eo pid=,args= 2>/dev/null | grep -F -- 'opencode run' | grep -F -- "--model $model" \
+    | awk '{print $1}' | tr '\n' ' ' | sed 's/ $//' || true
+}
+
+db_warning() {
+  local db="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db" sz
+  [[ -f "$db" ]] || return 0
+  sz=$(wc -c < "$db" 2>/dev/null | tr -d ' ') || return 0
+  if (( sz >= DB_WARN_GB * 1024 * 1024 * 1024 )); then
+    printf "opencode's database is %s GB (%s); it keeps every event of every session — see the README's \"Disk usage\"\n" \
+      "$(( sz / 1024 / 1024 / 1024 ))" "$db"
+  fi
+  return 0
+}
+
 # Test hook. `OC_TASK_SOURCE_ONLY=1 . oc-task` defines the helpers above and
 # returns before any argument parsing, dependency check, or repo lookup, so the
 # test suite can exercise them directly. `return` fails outside a sourced file,
 # so an accidental direct execution with the variable set exits cleanly instead.
 if [[ -n "${OC_TASK_SOURCE_ONLY:-}" ]]; then return 0 2>/dev/null || exit 0; fi
 
+# A command that fails under `set -e` used to end the wrapper with no word of
+# why: no summary, no record, staged work left uncommitted (field report v0.4.0
+# #1, #12, #22, #27, #29). Remember the failing line, and let the exit handler
+# below turn it into a report.
+set -E
+trap 'err_code=$?; err_line=$LINENO; err_cmd=$BASH_COMMAND' ERR
+dispatched=0; finalized=0; died=""; signal_name=""; signal_num=0; lock_taken=0
+created_wt=0; created_branch=0; serve_pid=""; run_pid=""
+
 # ---------------------------------------------------------------- arguments
-spec=""; model_arg=""; idle_arg=""; branch=""; session=""; do_merge=0; dry_run=0; verified=""; role="implement"; branch_diff=0; copy_untracked=(); link_nm=auto; merge_msg=""; no_commit=0; squash=0
+spec=""; model_arg=""; idle_arg=""; branch=""; session=""; do_merge=0; dry_run=0; verified=""; role="implement"; branch_diff=0; copy_untracked=(); link_nm=auto; merge_msg=""; no_commit=0; squash=0; base_ref=""; parent_spec=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --brief|--spec) spec="${2:-}"; shift 2 ;;
@@ -179,13 +440,16 @@ while [[ $# -gt 0 ]]; do
     --model)    model_arg="${2:-}"; shift 2 ;;
     --idle-timeout) idle_arg="${2:-}"; shift 2 ;;
     --branch)   branch="${2:-}"; shift 2 ;;
+    --base)     base_ref="${2:-}"; [[ -n "$base_ref" ]] || die "$EX_ERR" "--base needs a ref"; shift 2 ;;
     --session)  session="${2:-}"; shift 2 ;;
+    --continue-from) parent_spec="${2:-}"; [[ -n "$parent_spec" ]] || die "$EX_ERR" "--continue-from needs a brief path"; shift 2 ;;
     --verified) verified="${2:-}"; shift 2 ;;
     --merge)    do_merge=1; shift ;;
     --dry-run)  dry_run=1; shift ;;
     --copy-untracked) copy_untracked+=("${2:-}"); shift 2 ;;
     --link-node-modules)    link_nm=yes; shift ;;
     --no-link-node-modules) link_nm=no;  shift ;;
+    --install)  link_nm=install; shift ;;
     -m|--message) merge_msg="${2:-}"; shift 2 ;;
     --no-commit)  no_commit=1; shift ;;
     --squash)     squash=1; no_commit=1; shift ;;
@@ -200,6 +464,7 @@ if [[ $do_merge -eq 0 ]]; then
   [[ -z "$merge_msg" && $no_commit -eq 0 && $squash -eq 0 ]] \
     || die "$EX_ERR" "-m, --no-commit and --squash only apply to --merge"
 fi
+[[ -z "$base_ref" || -z "$session" ]] || die "$EX_ERR" "--base starts a new branch; it cannot be combined with --session"
 
 case "$role" in implement|review) ;; *) die "$EX_ERR" "--role must be implement or review, got: $role" ;; esac
 if [[ $role == review ]]; then REQUIRED_SECTIONS=("${REVIEW_SECTIONS[@]}"); else REQUIRED_SECTIONS=("${IMPLEMENT_SECTIONS[@]}"); fi
@@ -218,10 +483,12 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 #model=$DEFAULT_MODEL
 # Seconds a run may produce no output before the watchdog kills it. 0 disables.
 #idle_timeout=$DEFAULT_IDLE_TIMEOUT
+# Seconds to let opencode recover from a provider rate limit before exit 5.
+#rate_limit_grace=$DEFAULT_RATE_LIMIT_GRACE
 EOF
 fi
-config_model=$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*//p' "$CONFIG_FILE" | tail -1 | tr -d '[:space:]')
-config_idle=$(sed -n 's/^[[:space:]]*idle_timeout[[:space:]]*=[[:space:]]*//p' "$CONFIG_FILE" | tail -1 | tr -d '[:space:]')
+config_get() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONFIG_FILE" | tail -1 | tr -d '[:space:]'; }
+config_model=$(config_get model); config_idle=$(config_get idle_timeout); config_grace=$(config_get rate_limit_grace)
 if   [[ -n "$model_arg" ]];                   then model="$model_arg";              model_src="--model"
 elif [[ -n "${OC_DELEGATE_MODEL:-}" ]];       then model="$OC_DELEGATE_MODEL";      model_src="\$OC_DELEGATE_MODEL"
 elif [[ -n "$config_model" ]];                then model="$config_model";           model_src="$CONFIG_FILE"
@@ -232,12 +499,18 @@ elif [[ -n "${OC_DELEGATE_IDLE_TIMEOUT:-}" ]];    then idle_timeout="$OC_DELEGAT
 elif [[ -n "$config_idle" ]];                     then idle_timeout="$config_idle"
 else                                                   idle_timeout="$DEFAULT_IDLE_TIMEOUT"
 fi
+rate_grace="${OC_DELEGATE_RATE_LIMIT_GRACE:-${config_grace:-$DEFAULT_RATE_LIMIT_GRACE}}"
 [[ "$idle_timeout" =~ ^[0-9]+$ ]] || die "$EX_ERR" "--idle-timeout takes whole seconds (0 disables), got: $idle_timeout"
+[[ "$rate_grace" =~ ^[0-9]+$ ]]   || die "$EX_ERR" "rate_limit_grace takes whole seconds, got: $rate_grace"
 [[ "$model" == */* ]] || die "$EX_ERR" "model must be provider/model, got: $model"
 # Fail fast on a model that is not in the live catalog (free-tier ids rotate);
 # otherwise it only surfaces as a generic server error after the worktree exists.
-if ! opencode models </dev/null 2>/dev/null | grep -qxF "$model"; then
-  die "$EX_ERR" "model '$model' (from $model_src) is not in opencode's catalog. Free models right now:"$'\n'"$(opencode models </dev/null 2>/dev/null | grep -E -- '-free$|big-pickle' | sed 's/^/  /')"$'\n'"Pick one with --model, or run: oc-models --free --verbose"
+# Read the whole catalog first: `opencode models | grep -q` under pipefail
+# failed whenever grep's early exit cut opencode off mid-write, refusing a
+# model that was listed.
+catalog=$(opencode models </dev/null 2>/dev/null) || true
+if ! grep -qxF "$model" <<<"$catalog"; then
+  die "$EX_ERR" "model '$model' (from $model_src) is not in opencode's catalog. Free models right now:"$'\n'"$(grep -E -- '-free$|big-pickle' <<<"$catalog" | sed 's/^/  /')"$'\n'"Pick one with --model, or run: oc-models --free --verbose"
 fi
 
 # ---------------------------------------------------------------- repo
@@ -281,7 +554,7 @@ fi
 
 # ================================================================ MERGE MODE
 if [[ $do_merge -eq 1 ]]; then
-  refuse() { echo "oc-task: merge refused — $*" >&2; exit "$EX_ERR"; }
+  refuse() { died=1; echo "oc-task: merge refused — $*" >&2; exit "$EX_ERR"; }
   [[ -n "$branch" || -n "$session" ]] || refuse "pass --branch <name> or --session <id> to pick the run"
   # The latest *implement* run on the branch is what gets merged; review runs
   # produce no changes and no "Files changed:" line.
@@ -291,6 +564,7 @@ if [[ $do_merge -eq 1 ]]; then
   branch=$(jq -r .branch "$rec"); base=$(jq -r .base_branch "$rec")
   run_id=$(jq -r .run_id "$rec"); rmodel=$(jq -r .model "$rec"); rspec=$(jq -r .spec "$rec")
   rsession=$(jq -r .session_id "$rec"); rexit=$(jq -r .exit_code "$rec"); rresult=$(jq -r .result "$rec")
+  rstate=$(jq -r '.state // "done"' "$rec")
 
   # 1. on the base branch, clean tree. The one exemption is .gitignore, which
   #    oc-task itself edits at dispatch time.
@@ -298,7 +572,8 @@ if [[ $do_merge -eq 1 ]]; then
   [[ "$cur" == "$base" ]] || refuse "currently on '$cur', but the worktree forked from '$base' — check it out first"
   dirty=$(git status --porcelain --untracked-files=no | grep -vE '^.. \.gitignore$' || true)
   [[ -z "$dirty" ]] || refuse "working tree is dirty:"$'\n'"$dirty"
-  # 2. the run exited 0
+  # 2. the run finished, and exited 0
+  [[ "$rstate" != running ]] || refuse "run $run_id never finished (its record still says running): its wrapper died or is still live"
   [[ "$rexit" == "0" ]] || refuse "run $run_id exited $rexit, not 0"
   # 3. a parseable RESULT block
   grep -q '^## RESULT' <<<"$rresult" && grep -qi '^Files changed:' <<<"$rresult" \
@@ -306,11 +581,12 @@ if [[ $do_merge -eq 1 ]]; then
   # 4. the caller re-ran verification. oc-task never trusts the model's own claim.
   [[ -n "$verified" ]] || refuse "pass --verified \"<command>\" — the verification command you re-ran yourself in the worktree and saw pass"
   # 5. every changed file is named in a spec's Files section. Correction specs
-  #    list only what they fix, so take the union over every run on this branch.
+  #    list only what they fix, so take the union over every run on this
+  #    branch, and over the parent brief of every continuation run.
   git show-ref --verify --quiet "refs/heads/$branch" || refuse "branch '$branch' no longer exists"
   mapfile -t tokens < <(
-    for f in "$runs_dir"/*.json; do jq -r "select(.branch == \"$branch\") | .spec" "$f"; done 2>/dev/null \
-      | sort -u | while read -r sp; do
+    for f in "$runs_dir"/*.json; do jq -r "select(.branch == \"$branch\") | .spec, (.parent_spec // empty)" "$f"; done 2>/dev/null \
+      | grep -v '^$' | sort -u | while read -r sp; do
           # `continue` rather than `&&`: one unreadable or file-less spec must
           # not end the loop, or the union silently stops at that brief.
           [[ -f "$sp" ]] || continue
@@ -374,19 +650,26 @@ fi
 spec_problems=$(check_spec) && spec_ok=1 || spec_ok=0
 spec_abs=$(readlink -f "$spec" 2>/dev/null || echo "$spec")
 spec_rel=$(realpath --relative-to="$repo_root" "$spec_abs" 2>/dev/null || echo "$spec")
+parent_rel=""
+if [[ -n "$parent_spec" ]]; then
+  parent_abs=$(readlink -f "$parent_spec" 2>/dev/null || echo "$parent_spec")
+  parent_rel=$(realpath --relative-to="$repo_root" "$parent_abs" 2>/dev/null || echo "$parent_spec")
+fi
 
-# Where does this run live? Three cases:
+# Where does this run live? Four cases:
 #   --session <id>          resume: reuse the worktree recorded for that session
-#   --session new --branch  new session, existing worktree (post-image-limit continuation)
+#   --session new --branch  new session, existing worktree (or an existing
+#                           branch with no worktree, which gets one)
+#   --base <ref>            fresh branch + worktree off <ref>
 #   (neither)               fresh branch + worktree off current HEAD
-resume=0; reuse_wt=0
+resume=0; reuse_wt=0; adopt_branch=0
 if [[ -n "$session" && "$session" != "new" ]]; then
   dead_rec=$(find_run ".session_id == \"$session\" and .dead == true")
   if [[ -n "$dead_rec" ]]; then
     die "$EX_IMAGES" "session $session is recorded as dead ($(jq -r '.dead_reason // "unrecoverable"' "$dead_rec")) in $dead_rec — it can never be retried. Start a fresh session: --session new --branch $(jq -r .branch "$dead_rec")"
   fi
   rec=$(find_run ".session_id == \"$session\"") || true
-  [[ -n "$rec" ]] || die "$EX_ERR" "no run record in $RUNS_DIR for session $session"
+  [[ -n "$rec" ]] || die "$EX_ERR" "no run record in $RUNS_DIR for session $session — start a fresh session with --session new --branch <branch>"
   branch=$(jq -r .branch "$rec"); base_branch=$(jq -r .base_branch "$rec"); base_sha=$(jq -r .base_sha "$rec")
   resume=1; reuse_wt=1
 elif [[ "$session" == "new" ]]; then
@@ -394,60 +677,146 @@ elif [[ "$session" == "new" ]]; then
   rec=$(find_run ".branch == \"$branch\"") || true
   if [[ -n "$rec" ]]; then
     base_branch=$(jq -r .base_branch "$rec"); base_sha=$(jq -r .base_sha "$rec")
-  elif [[ -d "$wt_root/$branch" ]]; then
-    # A dispatch died before it could write a record (field report #2). The
-    # worktree and its checkpoint commits are still good, so recover the fork
-    # point from git rather than making the operator delete it by hand.
+  elif [[ -d "$wt_root/$branch" ]] || git show-ref --verify --quiet "refs/heads/$branch"; then
+    # No record: a dispatch died before it could write one (field report #2),
+    # or the branch was made by hand or by another tool. The branch and its
+    # commits are still good, so recover the fork point from git rather than
+    # making the operator delete anything.
     base_branch=$(git symbolic-ref --short HEAD 2>/dev/null) || die "$EX_ERR" "HEAD is detached; check out a branch first"
     base_sha=$(git merge-base HEAD "$branch" 2>/dev/null) || base_sha=$(git rev-parse HEAD)
-    echo "oc-task: no run record for branch $branch; adopting the existing worktree (base $base_branch @ ${base_sha:0:7})" >&2
+    if [[ -d "$wt_root/$branch" ]]; then
+      echo "oc-task: no run record for branch $branch; adopting the existing worktree (base $base_branch @ ${base_sha:0:7})" >&2
+    else
+      echo "oc-task: no run record for branch $branch; adopting the existing branch in a new worktree (base $base_branch @ ${base_sha:0:7})" >&2
+    fi
   else
-    die "$EX_ERR" "no run record in $RUNS_DIR for branch $branch, and no worktree at $WORKTREES_DIR/$branch — dispatch without --session to start a fresh one"
+    die "$EX_ERR" "no run record in $RUNS_DIR for branch $branch, no branch of that name, and no worktree at $WORKTREES_DIR/$branch — dispatch without --session to start a fresh one"
   fi
   session=""; reuse_wt=1
 else
   base_branch=$(git symbolic-ref --short HEAD 2>/dev/null) || die "$EX_ERR" "HEAD is detached; check out a branch first"
-  base_sha=$(git rev-parse HEAD)
+  if [[ -n "$base_ref" ]]; then
+    base_sha=$(git rev-parse --verify --quiet "$base_ref^{commit}") || die "$EX_ERR" "--base: no such commit: $base_ref"
+  else
+    base_sha=$(git rev-parse HEAD)
+  fi
   if [[ -z "$branch" ]]; then
     b=$(basename "$spec"); b="${b%.*}"; b=$(tr -c 'A-Za-z0-9_.-' '-' <<<"$b" | sed 's/-*$//')
     branch="oc/${b:-task}-$(date +%H%M%S)"
   fi
 fi
 worktree="$wt_root/$branch"
-# Set to 1 only when this invocation created the worktree, so the teardown can
-# never remove one the caller already had.
-created_wt=0
+# A worktree the record (or the operator) expects but that is gone: if its
+# branch survives, give it a worktree again at the same path.
+if [[ $reuse_wt -eq 1 && ! -d "$worktree" ]]; then
+  git show-ref --verify --quiet "refs/heads/$branch" \
+    || die "$EX_ERR" "worktree $WORKTREES_DIR/$branch is gone and so is branch $branch — cannot resume"
+  adopt_branch=1
+fi
 run_id="$(date +%Y%m%dT%H%M%S)-$(tr '/' '_' <<<"$branch")"
 log="$runs_dir/$run_id.log"; diff_out="$runs_dir/$run_id.diff"; rec_out="$runs_dir/$run_id.json"
+serve_log="$runs_dir/$run_id.serve.log"; summary_out="$runs_dir/$run_id.summary"
+install_log="$runs_dir/$run_id.install.log"; prompt_file="$spec_abs"
+
+if [[ -d "$worktree" ]]; then
+  held=$(live_lock)
+  [[ -z "$held" ]] || die "$EX_ERR" "$(lock_busy_msg "pid ${held%% *}, run ${held#* }")"
+fi
 
 if [[ $dry_run -eq 1 ]]; then
   echo "model:    $model  (from $model_src)"
-  echo "branch:   $branch  (base: $base_branch @ ${base_sha:0:7})"
-  echo "worktree: $WORKTREES_DIR/$branch$( [[ $reuse_wt -eq 1 ]] && echo '  (existing)' )"
+  if [[ -n "$base_ref" ]]; then
+    echo "branch:   $branch  (forks from $base_ref @ ${base_sha:0:7}; merges into $base_branch)"
+  else
+    echo "branch:   $branch  (base: $base_branch @ ${base_sha:0:7})"
+  fi
+  if   [[ $adopt_branch -eq 1 ]]; then wt_note='  (new, for the existing branch)'
+  elif [[ $reuse_wt -eq 1 ]];     then wt_note='  (existing)'
+  else wt_note=''; fi
+  echo "worktree: $WORKTREES_DIR/$branch$wt_note"
   echo "session:  ${session:-<new>}"
   echo "brief:    $spec_rel  (role: $role)"
+  [[ -z "$parent_rel" ]] || echo "parent:   $parent_rel  (sections the brief does not repeat come from here)"
+  if [[ $reuse_wt -eq 0 || $adopt_branch -eq 1 ]]; then echo "deps:     node_modules: $link_nm"; fi
   if [[ $spec_ok -eq 1 ]]; then echo "sections: ok (${REQUIRED_SECTIONS[*]})"
   else echo "sections: REJECTED"; sed 's/^/  /' <<<"$spec_problems"; exit "$EX_SPEC"; fi
   exit "$EX_OK"
 fi
 [[ $spec_ok -eq 1 ]] || die "$EX_SPEC" "brief rejected (role $role):"$'\n'"$spec_problems"
 
+# From here on oc-task creates things, so every way out is handled: a signal
+# stops the run and undoes a worktree made before dispatch; after dispatch,
+# every exit writes the record and the summary.
+cleanup() {
+  kill_run
+  if [[ -n "${serve_pid:-}" ]]; then kill_tree "$serve_pid"; wait "$serve_pid" 2>/dev/null || true; serve_pid=""; fi
+  release_lock
+  return 0
+}
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [[ $dispatched -eq 1 && $finalized -eq 0 ]]; then
+    internal_error="line ${err_line:-?}: ${err_cmd:-?} (exit ${err_code:-$rc})"
+    finalize
+    rc=$status
+  elif [[ $dispatched -eq 0 && $rc -ne 0 && -z "$died" ]]; then
+    # Before dispatch, an exit that is not a die() is a failure inside
+    # oc-task. Say where, and undo a worktree this invocation made.
+    echo "oc-task: internal error at line ${err_line:-?}: ${err_cmd:-?} (exit ${err_code:-$rc})" >&2
+    discard_new_worktree
+  fi
+  cleanup
+  exit "$rc"
+}
+# A killed wrapper must mean a killed run, and it must still say what
+# happened: before, a signal ended the wrapper with no summary, no record and
+# no checkpoint of the work in the worktree.
+on_signal() { # $1 = name, $2 = number
+  trap - EXIT INT TERM HUP
+  signal_name=$1; signal_num=$2
+  kill_run
+  if [[ $dispatched -eq 1 && $finalized -eq 0 ]]; then finalize
+  elif [[ $dispatched -eq 0 ]]; then discard_new_worktree; fi
+  cleanup
+  exit $(( 128 + $2 ))
+}
+trap on_exit EXIT
+trap 'on_signal INT 2' INT
+trap 'on_signal TERM 15' TERM
+trap 'on_signal HUP 1' HUP
+# The ERR trap has recorded every harmless failure so far; only what fails
+# from here on can explain an unexpected exit.
+err_line=""; err_cmd=""; err_code=""
+
+# One live run per worktree, claimed before the worktree is touched.
+[[ ! -d "$worktree" ]] || acquire_lock
+
 # ---------------------------------------------------------------- worktree
 mkdir -p "$runs_dir"
 for entry in "$WORKTREES_DIR/" "$RUNS_DIR/"; do
   grep -qxF "$entry" .gitignore 2>/dev/null || printf '%s\n' "$entry" >> .gitignore
 done
-if [[ $reuse_wt -eq 1 ]]; then
-  [[ -d "$worktree" ]] || die "$EX_ERR" "worktree $WORKTREES_DIR/$branch is gone — cannot resume"
-else
+new_wt=0
+if [[ $adopt_branch -eq 1 ]]; then
+  mkdir -p "$(dirname "$worktree")"
+  # A worktree deleted by hand stays registered, and git then refuses to
+  # check its branch out again. Prune drops only entries whose directory is gone.
+  git worktree prune >/dev/null 2>&1 || true
+  git worktree add -q "$worktree" "$branch" 2>/dev/null \
+    || die "$EX_ERR" "git worktree add failed for existing branch $branch — is it checked out in another worktree? (git worktree list)"
+  created_wt=1; new_wt=1
+elif [[ $reuse_wt -eq 0 ]]; then
   [[ ! -e "$worktree" ]] || die "$EX_ERR" "worktree $WORKTREES_DIR/$branch already exists. Pass --session <id> to resume it, --session new to reuse it, or choose another --branch"
-  ! git show-ref --verify --quiet "refs/heads/$branch" || die "$EX_ERR" "branch '$branch' already exists; choose another --branch"
-  git worktree add -q -b "$branch" "$worktree" HEAD 2>/dev/null || die "$EX_ERR" "git worktree add failed for $branch"
-  created_wt=1
-  # The worktree forks from HEAD, so anything untracked — the very files a task
-  # is often about — is simply missing from it, and node_modules is never there
-  # at all (field report #6, #7). Provision both, and remember what we put
-  # there so it never reaches the diff.
+  ! git show-ref --verify --quiet "refs/heads/$branch" || die "$EX_ERR" "branch '$branch' already exists. Pass --session new --branch $branch to work on it, or choose another --branch"
+  git worktree add -q -b "$branch" "$worktree" "$base_sha" 2>/dev/null || die "$EX_ERR" "git worktree add failed for $branch"
+  created_wt=1; created_branch=1; new_wt=1
+fi
+if [[ $new_wt -eq 1 ]]; then
+  # The worktree forks from a commit, so anything untracked — the very files a
+  # task is often about — is simply missing from it, and node_modules is never
+  # there at all (field report #6, #7). Provision both, and remember what we
+  # put there so it never reaches the diff.
   for p in "${copy_untracked[@]:-}"; do
     [[ -n "$p" ]] || continue
     rel="${p#./}"; rel="${rel%/}"
@@ -458,51 +827,68 @@ else
     provision_add "$rel"
     echo "oc-task: copied untracked $rel into the worktree" >&2
   done
-  if [[ "$link_nm" == yes || ( "$link_nm" == auto && -d "$repo_root/node_modules" && ! -e "$worktree/node_modules" ) ]]; then
+  if [[ "$link_nm" == install ]]; then
+    install_deps && rc=0 || rc=$?
+    case $rc in
+      0) ;;
+      2) die_fresh "$EX_ERR" "--install: no lockfile (package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock) in the worktree" ;;
+      3) die_fresh "$EX_ERR" "--install: the package manager for this lockfile is not installed" ;;
+      *) die_fresh "$EX_ERR" "--install failed; last lines of $RUNS_DIR/$run_id.install.log:"$'\n'"$(tail -5 "$install_log" 2>/dev/null)" ;;
+    esac
+    [[ -d "$worktree/node_modules" ]] && provision_add "node_modules"
+    while IFS= read -r p; do
+      d=${p%/package.json}; [[ -d "$worktree/$d/node_modules" ]] && provision_add "$d/node_modules"
+    done < <(git -C "$worktree" ls-files -- '*/package.json' 2>/dev/null)
+  elif [[ "$link_nm" == yes || ( "$link_nm" == auto && -d "$repo_root/node_modules" && ! -e "$worktree/node_modules" ) ]]; then
     if [[ -d "$repo_root/node_modules" ]]; then
-      ln -s "$repo_root/node_modules" "$worktree/node_modules"
+      link_nm_dir "$repo_root/node_modules" "$worktree/node_modules" || die_fresh "$EX_ERR" "could not link node_modules into the worktree"
       provision_add "node_modules"
-      echo "oc-task: linked node_modules into the worktree" >&2
+      nested=()
+      while IFS= read -r d; do
+        link_nm_dir "$repo_root/$d/node_modules" "$worktree/$d/node_modules" || die_fresh "$EX_ERR" "could not link $d/node_modules into the worktree"
+        provision_add "$d/node_modules"; nested+=("$d")
+      done < <(nested_nm_dirs)
+      echo "oc-task: linked node_modules into the worktree (its own directory; workspace packages resolve to the worktree${nested[0]:+; also ${nested[*]}})" >&2
     elif [[ "$link_nm" == yes ]]; then
       die_fresh "$EX_ERR" "--link-node-modules: no node_modules in $repo_root"
     fi
+  elif [[ "$link_nm" == auto && -f "$worktree/package.json" && ! -e "$worktree/node_modules" ]]; then
+    echo "oc-task: warning: $repo_root has no node_modules, so the worktree has no dependencies. Pass --install to install them there." >&2
   fi
 fi
 
 # Provisioned paths must stay out of every commit made inside this worktree,
 # not just oc-task's own checkpoint (which the pathspecs above cover): the
 # model commits mid-run with a plain `git add -A` that takes no pathspec, and
-# that would put the provisioned inputs and symlink on the branch (field
+# that would put the provisioned inputs and links on the branch (field
 # report #6, #7). An excludes file hides them from every git invocation, but
 # it cannot live in info/exclude — git resolves that to the common dir shared
 # with the base checkout, and even `git config` in a linked worktree writes
 # there, so the base would start ignoring these paths too — and a .gitignore
 # would itself be committed. Instead, export core.excludesFile for this
 # process tree only: it reaches opencode and every git it spawns, changes no
-# config file anywhere, and vanishes with this process. Later runs in the
-# same worktree rebuild nothing; the private files persist with the worktree.
+# config file anywhere, and vanishes with this process. The excludes file is
+# rebuilt on every run, so paths provisioned by a later run are covered too.
 prov_list=$(provision_file) || prov_list=""
 if [[ -n "$prov_list" && -s "$prov_list" ]]; then
   prov_excl="${prov_list}.excludes"
-  if [[ ! -f "$prov_excl" ]]; then
-    : > "$prov_excl" || true
-    # Our value shadows the operator's configured excludes file inside this
-    # process tree, so carry its patterns over rather than dropping them.
-    prev_excl=$(git config --get core.excludesFile 2>/dev/null || true)
-    prev_excl="${prev_excl/#\~/$HOME}"
-    if [[ -n "$prev_excl" && -f "$prev_excl" ]]; then
-      cat "$prev_excl" >> "$prov_excl" || true
-    else
-      for g in "${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore" "$HOME/.config/git/ignore"; do
-        if [[ -f "$g" ]]; then cat "$g" >> "$prov_excl" || true; break; fi
-      done
-    fi
-    # Anchor our entries to the worktree root: a bare basename pattern would
-    # match at any depth and silently drop a legitimately created nested path
-    # (e.g. `src/inputs/`) from every commit. The operator's own patterns
-    # above keep their original meaning.
-    sed '/^$/d; s|^|/|' "$prov_list" >> "$prov_excl" || true
+  : > "$prov_excl" || true
+  # Our value shadows the operator's configured excludes file inside this
+  # process tree, so carry its patterns over rather than dropping them.
+  prev_excl=$(git config --get core.excludesFile 2>/dev/null || true)
+  prev_excl="${prev_excl/#\~/$HOME}"
+  if [[ -n "$prev_excl" && -f "$prev_excl" && "$prev_excl" != "$prov_excl" ]]; then
+    cat "$prev_excl" >> "$prov_excl" || true
+  else
+    for g in "${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore" "$HOME/.config/git/ignore"; do
+      if [[ -f "$g" ]]; then cat "$g" >> "$prov_excl" || true; break; fi
+    done
   fi
+  # Anchor our entries to the worktree root: a bare basename pattern would
+  # match at any depth and silently drop a legitimately created nested path
+  # (e.g. `src/inputs/`) from every commit. The operator's own patterns
+  # above keep their original meaning.
+  sed '/^$/d; s|^|/|' "$prov_list" >> "$prov_excl" || true
   # Append to, rather than replace, any GIT_CONFIG_COUNT the operator already
   # exported, so their configuration survives this process tree.
   n="${GIT_CONFIG_COUNT:-0}"
@@ -510,27 +896,42 @@ if [[ -n "$prov_list" && -s "$prov_list" ]]; then
   export "GIT_CONFIG_KEY_$n=core.excludesFile" "GIT_CONFIG_VALUE_$n=$prov_excl" GIT_CONFIG_COUNT=$((n + 1))
 fi
 
+[[ $lock_taken -eq 1 ]] || acquire_lock
+
+# A continuation brief carries only what changed; the parent rides along
+# below it so the model still has every section (field report v0.4.0 #6).
+if [[ -n "$parent_spec" ]]; then
+  prompt_file="$runs_dir/$run_id.prompt.md"
+  { cat "$spec_abs"; printf '\n\n---\n\n'
+    printf '# Parent brief (for reference)\n\nThe brief above continues the brief below. Where they differ, the brief above wins; every section it does not repeat applies as written below.\n\n'
+    cat "$parent_abs"; } > "$prompt_file"
+fi
+
+warnings=()
+others=$(other_runs_on_model)
+if [[ -n "$others" ]]; then
+  n_others=$(wc -w <<<"$others" | tr -d ' ')
+  warnings+=("$n_others other opencode run(s) already use $model (pid $others); provider limits are per account, so expect rate limits")
+  echo "oc-task: warning: ${warnings[-1]}" >&2
+fi
+dbw=$(db_warning)
+if [[ -n "$dbw" ]]; then warnings+=("$dbw"); echo "oc-task: warning: $dbw" >&2; fi
+
 # ---------------------------------------------------------------- opencode server
 # opencode reads stdin to EOF whenever stdin is not a TTY (inside an agent's shell
 # it is a socket that never closes), so every opencode/curl call below gets an
-# explicit stdin and a timeout.
-serve_pid=""; run_pid=""; serve_log=$(mktemp)
-# A killed wrapper must mean a killed run. Previously the trap took the server
-# down but left `opencode run` alive, so the run kept committing with nothing
-# to talk to and no summary was ever written (field report #8).
-cleanup() {
-  kill_run
-  [[ -n "${serve_pid:-}" ]] && { kill "$serve_pid" 2>/dev/null || true; }
-  rm -f "$serve_log"
-  return 0
-}
-trap cleanup EXIT
-trap 'trap - EXIT; cleanup; exit 143' INT TERM HUP
+# explicit stdin and a timeout. The server logs WARN and above to its own
+# per-run file: that is the only place a provider's refusal is written down.
+
 url=""
 for attempt in 1 2 3 4 5; do
   port=$(( 20000 + RANDOM % 40000 ))
   : > "$serve_log"
-  ( cd "$worktree" && exec opencode serve --port "$port" </dev/null >"$serve_log" 2>&1 ) & serve_pid=$!
+  # Its own process group, like the run: a stray group-wide signal from either
+  # side must not take the wrapper down with it.
+  set -m
+  ( cd "$worktree" && exec opencode serve --port "$port" --print-logs --log-level WARN </dev/null >"$serve_log" 2>&1 ) & serve_pid=$!
+  set +m
   for _ in $(seq 1 80); do
     grep -q 'listening on' "$serve_log" 2>/dev/null && break
     kill -0 "$serve_pid" 2>/dev/null || break
@@ -539,21 +940,215 @@ for attempt in 1 2 3 4 5; do
   if grep -q 'listening on' "$serve_log" && curl -sf -m 3 "http://127.0.0.1:$port/global/health" >/dev/null 2>&1; then
     url="http://127.0.0.1:$port"; break
   fi
-  kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true; serve_pid=""
+  kill_tree "$serve_pid"; wait "$serve_pid" 2>/dev/null || true; serve_pid=""
 done
-[[ -n "$url" ]] || die_fresh "$EX_ERR" "could not start opencode serve (last attempt on port $port):"$'\n'"$(tail -5 "$serve_log")"$'\n'"the branch and worktree this run created were removed; fix the cause and dispatch again."
+[[ -n "$url" ]] || die_fresh "$EX_ERR" "could not start opencode serve (last attempt on port $port):"$'\n'"$(tail -5 "$serve_log")"$'\n'"the worktree this run created was removed; fix the cause and dispatch again."
 
 # Permissions are auto-approved for this session ONLY because the model is
 # confined to a throwaway git worktree: the base branch is untouched, every
 # change is a diff you review before merging, and oc-undo reverts a merge in
 # one command. Do not loosen this into running against the main checkout.
+# The one thing a worktree does not confine is state shared by every worktree
+# of the repository. The stash is the dangerous one: a model's `git stash pop`
+# applied the user's own WIP stash into its worktree and then reset it
+# (field report v0.4.0 #13). opencode applies the last matching rule, and its
+# `*` spans spaces, so these denials win over the blanket allow.
+permission_json='[{"permission":"*","pattern":"*","action":"allow"},
+  {"permission":"bash","pattern":"*git stash*","action":"deny"},
+  {"permission":"bash","pattern":"*git -C * stash*","action":"deny"}]'
 if [[ $resume -eq 0 ]]; then
   session=$(curl -sf -m 15 -X POST "$url/session?directory=$(uri_escape "$worktree")" \
       -H 'Content-Type: application/json' \
-      -d "$(jq -cn --arg t "oc-task $run_id" '{title:$t, permission:[{permission:"*",pattern:"*",action:"allow"}]}')" \
+      -d "$(jq -cn --arg t "oc-task $run_id" --argjson p "$permission_json" '{title:$t, permission:$p}')" \
     | jq -r '.id // empty') || true
-  [[ "$session" == ses_* ]] || die_fresh "$EX_ERR" "opencode did not return a session id (is opencode authenticated? does '$url' answer?). The branch and worktree this run created were removed; fix the cause and dispatch again."
+  [[ "$session" == ses_* ]] || die_fresh "$EX_ERR" "opencode did not return a session id (is opencode authenticated? does '$url' answer?). The worktree this run created was removed; fix the cause and dispatch again."
 fi
+
+# ---------------------------------------------------------------- record
+# Written now, before the model runs, and rewritten when it ends: a wrapper
+# that dies mid-run still leaves the session id to resume from, the branch
+# base, and the brief that authorizes its files at merge (field report v0.4.0
+# #4, #16, #22; evaluation D54).
+write_record() { # $1 = state: running | done
+  local tmp="$rec_out.tmp"
+  jq -n --arg state "$1" --arg run_id "$run_id" --arg branch "$branch" --arg worktree "$worktree" \
+        --arg base_branch "$base_branch" --arg base_sha "$base_sha" --arg base_ref "$base_ref" \
+        --arg model "$model" --arg spec "$spec_rel" --arg parent_spec "$parent_rel" --arg role "$role" \
+        --arg start_sha "$start_sha" --arg session_id "$session" \
+        --argjson exit_code "${status:-null}" --argjson oc_exit "${oc_exit:-null}" \
+        --argjson duration "${duration:-0}" --argjson dead "${dead:-false}" --arg dead_reason "${dead_reason:-}" \
+        --argjson stalled "${stalled:-0}" --argjson idle_timeout "$idle_timeout" \
+        --argjson provisioned "${provisioned_json:-[]}" \
+        --arg head_sha "${head_sha:-}" --arg result "${result:0:65536}" --arg status_line "${status_line:-}" \
+        --arg limit "${limit_msg:-}" --arg internal_error "${internal_error:-}" --argjson wrapper_pid "$$" \
+        --arg log "$log" --arg diff "$diff_out" --arg serve_log "$serve_log" --arg summary "$summary_out" \
+        '$ARGS.named' > "$tmp" && mv -f "$tmp" "$rec_out"
+}
+
+# ---------------------------------------------------------------- collect
+# Everything after the run, on every path out of it: a normal end, a signal,
+# or a command that failed inside oc-task itself. Runs with errexit off and
+# reports what it could not do rather than dying silently.
+finalize() {
+  set +e
+  finalized=1
+  kill_run
+  if [[ -n "${serve_pid:-}" ]]; then kill_tree "$serve_pid"; wait "$serve_pid" 2>/dev/null; serve_pid=""; fi
+  duration=$(( $(date +%s) - ${start:-$(date +%s)} ))
+  [[ "${oc_exit:-}" =~ ^[0-9]+$ ]] || oc_exit=-1
+
+  # Implement runs: anything the model left uncommitted becomes a final
+  # checkpoint so this run's diff is the whole story. Review runs must not
+  # change anything; if one somehow did, discard it and say so.
+  local wt_pathspec=() ck_out
+  review_note=""; checkpoint_err=""
+  mapfile -t wt_pathspec < <(provision_pathspec)
+  if [[ -n "$(git -C "$worktree" status --porcelain -- "${wt_pathspec[@]}" 2>/dev/null)" ]]; then
+    if [[ $role == review ]]; then
+      review_note="reviewer modified $(git -C "$worktree" status --porcelain -- "${wt_pathspec[@]}" | wc -l | tr -d ' ') file(s); changes discarded"
+      git -C "$worktree" reset -q --hard >/dev/null 2>&1
+      git -C "$worktree" clean -qfd -- "${wt_pathspec[@]}" >/dev/null 2>&1
+    elif ! ck_out=$(git -C "$worktree" add -A -- "${wt_pathspec[@]}" 2>&1); then
+      checkpoint_err="checkpoint failed (git add): $(head -1 <<<"$ck_out") — the run's work is still in the worktree, uncommitted"
+    elif ! ck_out=$(git -C "$worktree" -c user.name=oc-task -c user.email=oc-task@localhost \
+                      commit -q -m "oc-task: uncommitted changes at end of run $run_id" 2>&1); then
+      checkpoint_err="checkpoint failed (git commit): $(head -1 <<<"$ck_out") — the run's work is still in the worktree, staged"
+    fi
+  fi
+  # This run's diff: from the worktree HEAD before dispatch to after. For the
+  # first run on a branch that equals the branch diff; later runs (tasks 2..N in
+  # the same worktree) get just their own task's changes — the review package.
+  { echo "# run $run_id  ${start_sha:0:7}..$(git rev-parse --short "$branch")  (branch base ${base_sha:0:7})"; echo "# commits:";
+    git log --oneline "$start_sha..$branch" | sed 's/^/#   /'; echo; git diff -U10 "$start_sha" "$branch"; } > "$diff_out" 2>/dev/null
+  numstat=$(git diff --numstat "$start_sha" "$branch" 2>/dev/null)
+  head_sha=$(git rev-parse --short "$branch" 2>/dev/null)
+  [[ "$(git rev-parse "$branch" 2>/dev/null)" != "$start_sha" ]] || head_sha=""
+
+  local text errors serrs all_errs err_events events rate_hit db_hit binaries ctl f reset
+  text=$(run_text "$log")
+  result=$(awk '/^## RESULT[[:space:]]*$/ {buf=""; on=1} on {buf = buf $0 "\n"} END {printf "%s", buf}' <<<"$text" | dedouble_result)
+  # No heading: still surface the model's own verdict (field report v0.4.0 #20).
+  status_line=""
+  [[ -n "$result" ]] || status_line=$(grep -E '^[*_ ]*Status:' <<<"$text" | tail -1 | sed -E 's/^[*_ ]+//')
+  errors=$(run_errors "$log")
+  [[ -n "$errors" ]] || errors=$(grep -avE '^\{' "$log" 2>/dev/null | grep -aiE 'error|fail' | head -3)
+  serrs=$(serve_errors "$serve_log" | awk '!seen[$0]++' | tail -5)
+  all_errs=$(printf '%s\n%s\n%s' "$errors" "$serrs" "${limit_msg:-}")
+  err_events=$(grep -c '"type":"error"' "$log" 2>/dev/null); err_events=${err_events:-0}
+  events=$(model_event_count "$log"); events=${events:-0}
+  rate_hit=$(grep -iE "$RATE_LIMIT_RE" <<<"$all_errs" | tail -1)
+  db_hit=$(grep -iE "$DB_BUSY_RE" <<<"$all_errs" | tail -1)
+
+  status=$EX_OK; status_txt="success"; dead=false; dead_reason=""
+  local resume_hint after_limit
+  if [[ $role == review ]]; then
+    resume_hint="re-dispatch the review with --role review --session new --branch $branch"
+  else
+    resume_hint="re-dispatch with --session new --branch $branch (checkpoint ${head_sha:-${start_sha:0:7}})"
+  fi
+  after_limit="after the reset, resume with --session $session, or $resume_hint"
+  if [[ -n "$signal_name" ]]; then
+    status=$(( 128 + signal_num ))
+    status_txt="killed by SIG$signal_name; oc-task stopped the run and kept its work. Resume with --session $session, or $resume_hint"
+  elif grep -qiE "$IMAGE_LIMIT_RE" <<<"$errors" || { [[ $oc_exit -ne 0 ]] && grep -qiE "$IMAGE_LIMIT_RE" "$log"; }; then
+    status=$EX_IMAGES; dead=true; dead_reason="image-limit"
+    status_txt="session poisoned by image limit — not resumable. $resume_hint"
+  elif [[ -n "${limit_kind:-}" ]]; then
+    status=$EX_RATE
+    if [[ $limit_kind == hard ]]; then status_txt="usage limit reached at the provider; oc-task stopped the run at once. Do not retry before the reset; $after_limit"
+    else status_txt="rate limited by the provider for ${rate_grace}s with no recovery; oc-task stopped the run. Retry later, do not loop; $after_limit"; fi
+  elif [[ ${stalled:-0} -eq 1 ]]; then
+    if [[ -n "$rate_hit" ]]; then
+      status=$EX_RATE; limit_msg=${limit_msg:-$rate_hit}
+      status_txt="rate limited by the provider (the run went quiet after it, and the idle watchdog stopped it). Retry later, do not loop; $after_limit"
+    elif [[ $events -eq 0 ]]; then
+      status=$EX_RATE
+      status_txt="no model output at all in ${idle_timeout}s — almost always a provider limit. Tell the user and retry after it resets; $after_limit"
+    else
+      status=$EX_STALL; dead=true; dead_reason="stalled"
+      status_txt="stalled — no output for ${idle_timeout}s, run killed. Killing a run poisons its session, so it is not resumable: $resume_hint"
+    fi
+  elif grep -qiE "$POISON_RE" <<<"$errors" || { [[ $oc_exit -ne 0 ]] && grep -qiE "$POISON_RE" "$log"; }; then
+    status=$EX_IMAGES; dead=true; dead_reason="encrypted-content"
+    status_txt="session poisoned — the provider rejected this session's reasoning state (encrypted_content), which an interrupted turn always causes. not resumable: $resume_hint"
+  elif [[ $oc_exit -ne 0 || ${err_hang:-0} -eq 1 ]] || { [[ $err_events -gt 0 ]] && [[ -z "$result" ]]; }; then
+    if [[ -n "$rate_hit" ]]; then
+      status=$EX_RATE; limit_msg=${limit_msg:-$rate_hit}; status_txt="rate limited by the provider — retry later, do not loop; $after_limit"
+    elif [[ -n "$db_hit" ]]; then
+      status=$EX_DBBUSY; status_txt="opencode's local database was busy (another opencode run, or a bulk session delete, holds it). Retry when that work ends; $resume_hint"
+    elif [[ ${err_hang:-0} -eq 1 ]]; then
+      status=$EX_ERR; status_txt="opencode errored and then went quiet for ${ERROR_GRACE}s; oc-task stopped it. Read errors: below; $resume_hint"
+    else
+      status=$EX_ERR; status_txt="opencode errored"
+    fi
+  elif [[ -z "$numstat" && $role == implement ]]; then
+    status=$EX_NOCHANGE; status_txt="completed but produced zero changes"
+    if grep -qE 'NEEDS_CONTEXT|BLOCKED' <<<"${status_line:-$result}"; then
+      status_txt="the model stopped with $(grep -oE 'NEEDS_CONTEXT|BLOCKED' <<<"${status_line:-$result}" | head -1) and changed nothing — answer it and resume with --session $session"
+    fi
+  elif [[ $role == review && -z "$result" ]]; then
+    status=$EX_ERR; status_txt="review finished without a ## RESULT block"
+  fi
+  if [[ -n "${internal_error:-}" ]]; then
+    status=$EX_ERR
+    status_txt="oc-task itself failed at $internal_error after the run; the summary below is what it could collect"
+  fi
+  if [[ "$dead" == true ]]; then
+    jq -cn --arg s "$session" --arg r "$run_id" --arg reason "$dead_reason" \
+       '{type:"oc-task",event:"session-dead",reason:$reason,session_id:$s,run_id:$r}' >> "$log"
+  fi
+
+  warnings+=("${review_note:-}" "${checkpoint_err:-}")
+  binaries=$(awk '$1 == "-" {print $3}' <<<"$numstat" | grep -E "$TEXT_EXT_RE")
+  for f in $binaries; do warnings+=("$f diffs as binary — a source file with raw control bytes? (a NUL written for \\u0000)"); done
+  ctl=$(control_byte_files "$start_sha" "$branch")
+  for f in $ctl; do warnings+=("$f gained raw control bytes — an escape sequence written as the byte itself?"); done
+
+  local prov_file
+  prov_file=$(provision_file)
+  provisioned_json=$( { [[ -f "$prov_file" ]] && cat "$prov_file"; } 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))' )
+  [[ -n "$provisioned_json" ]] || provisioned_json='[]'
+
+  write_record done || echo "oc-task: warning: could not write the run record $rec_out" >&2
+
+  # ------------------------------------------------------------ summary
+  # Saved before it is printed: a closed stdout must not lose it.
+  {
+    echo "run:      $run_id  (role: $role)"
+    echo "session:  $session"
+    echo "model:    $model"
+    echo "exit:     $status ($status_txt)"
+    if [[ -n "${limit_msg:-}" ]]; then
+      echo "limit:    $(cut -c1-300 <<<"$limit_msg")"
+      reset=$(limit_reset "$limit_msg"); [[ -z "$reset" ]] || echo "reset:    $reset"
+    fi
+    echo "duration: $(fmt_duration "$duration")"
+    if [[ -n "$base_ref" ]]; then
+      echo "branch:   $branch  (worktree $WORKTREES_DIR/$branch, forked from $base_ref @ ${base_sha:0:7}, merges into $base_branch)"
+    else
+      echo "branch:   $branch  (worktree $WORKTREES_DIR/$branch, base $base_branch @ ${base_sha:0:7})"
+    fi
+    if [[ $role == review ]]; then echo "checkpoint: n/a (read-only run)"; else echo "checkpoint: ${head_sha:-none}"; fi
+    local w; for w in "${warnings[@]}"; do [[ -z "$w" ]] || echo "warning:  $w"; done
+    if [[ -n "$numstat" ]]; then
+      echo "files:"; awk '$1=="-" {printf "  binary  %s\n", $3; next} {printf "  +%s -%s  %s\n", $1, $2, $3}' <<<"$numstat"
+    else
+      echo "files:    none"
+    fi
+    if [[ -n "$errors$serrs" ]]; then
+      echo "errors:"
+      [[ -z "$errors" ]] || sed 's/^/  /' <<<"$errors" | cut -c1-400
+      [[ -z "$serrs" ]] || sed 's/^/  server: /' <<<"$serrs" | cut -c1-400
+    fi
+    if [[ -n "$result" ]]; then echo "$result"
+    elif [[ -n "$status_line" ]]; then echo "## RESULT: (none — no '## RESULT' heading; the model's last status line: $status_line)"
+    else echo "## RESULT: (none — model did not emit a RESULT block)"; fi
+    echo "log:  $RUNS_DIR/$run_id.log   (server: $RUNS_DIR/$run_id.serve.log)"
+    echo "diff: $RUNS_DIR/$run_id.diff"
+  } > "$summary_out" 2>/dev/null
+  cat "$summary_out" 2>/dev/null
+  return 0
+}
 
 # ---------------------------------------------------------------- dispatch
 # Reviews run opencode's built-in `plan` agent, which denies edits, so a
@@ -561,127 +1156,57 @@ fi
 agent_args=(); [[ $role == review ]] && agent_args=(--agent plan)
 start_sha=$(git -C "$worktree" rev-parse HEAD)
 start=$(date +%s)
-stalled=0
+stalled=0; err_hang=0; limit_kind=""; limit_msg=""; status=""; oc_exit=""
+result=""; status_line=""; head_sha=""; dead=false; dead_reason=""; duration=0; provisioned_json='[]'; internal_error=""
+: > "$log"
+write_record running
+dispatched=1
+echo "oc-task: dispatched run $run_id (session $session); log $RUNS_DIR/$run_id.log" >&2
 set +e
 # Job control puts the background job in its own process group, which is what
 # lets kill_run reach opencode's whole tree.
 set -m
 ( cd "$worktree" && exec opencode run --attach "$url" --session "$session" --dir "$worktree" \
-    "${agent_args[@]}" --model "$model" --format json --auto <"$spec_abs" >"$log" 2>&1 ) &
+    "${agent_args[@]}" --model "$model" --format json --auto <"$prompt_file" >"$log" 2>&1 ) &
 run_pid=$!
 set +m
-if [[ "$idle_timeout" -gt 0 ]]; then
-  last_size=-1; last_change=$(date +%s)
-  while kill -0 "$run_pid" 2>/dev/null; do
-    sleep "$IDLE_POLL"
-    size=$(wc -c <"$log" 2>/dev/null || echo 0)
-    now=$(date +%s)
-    if [[ "$size" != "$last_size" ]]; then
-      last_size="$size"; last_change="$now"
-    elif (( now - last_change >= idle_timeout )); then
-      stalled=1
-      kill_run
-      break
+
+# The watchdog. Three things end a run early, each read off a file every
+# IDLE_POLL seconds: a provider limit in the server's log (exit 5, at once
+# for a usage cap, after rate_limit_grace for a rate limit opencode did not
+# recover from); an error event in the run's own stream followed by
+# ERROR_GRACE seconds of silence; and no output at all for the idle timeout.
+last_size=-1; last_change=$(date +%s); seen_serve=0; seen_err=0; rate_since=0; rate_msg=""; err_since=0
+while kill -0 "$run_pid" 2>/dev/null; do
+  sleep "$IDLE_POLL"
+  now=$(date +%s)
+  size=$(wc -c <"$log" 2>/dev/null | tr -d ' '); size=${size:-0}
+  if [[ "$size" != "$last_size" ]]; then last_size="$size"; last_change="$now"; fi
+  mapfile -t serrs_now < <(serve_errors "$serve_log")
+  for (( i = seen_serve; i < ${#serrs_now[@]}; i++ )); do
+    m=${serrs_now[i]}
+    if   grep -qiE "$HARD_LIMIT_RE" <<<"$m"; then limit_kind=hard; limit_msg=$m
+    elif grep -qiE "$RATE_LIMIT_RE" <<<"$m"; then (( rate_since > 0 )) || rate_since=$now; rate_msg=$m
     fi
   done
-fi
+  seen_serve=${#serrs_now[@]}
+  if [[ "$limit_kind" == hard ]]; then kill_run; break; fi
+  if (( rate_since > 0 )); then
+    if (( last_change > rate_since )); then rate_since=0     # output after the error: opencode recovered
+    elif (( now - rate_since >= rate_grace )); then limit_kind=rate; limit_msg=$rate_msg; kill_run; break; fi
+  fi
+  nerr=$(grep -c '"type":"error"' "$log" 2>/dev/null); nerr=${nerr:-0}
+  if (( nerr > seen_err )); then seen_err=$nerr; err_since=$now; fi
+  if (( err_since > 0 )); then
+    if (( last_change > err_since )); then err_since=0
+    elif (( now - err_since >= ERROR_GRACE )); then err_hang=1; kill_run; break; fi
+  fi
+  if (( idle_timeout > 0 && now - last_change >= idle_timeout )); then stalled=1; kill_run; break; fi
+done
 wait "$run_pid"
 oc_exit=$?
 run_pid=""
 set -e
-duration=$(( $(date +%s) - start ))
-kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true; serve_pid=""
 
-# ---------------------------------------------------------------- collect
-# Implement runs: anything the model left uncommitted becomes a final
-# checkpoint so this run's diff is the whole story. Review runs must not change
-# anything; if one somehow did, discard it and say so.
-review_note=""
-mapfile -t wt_pathspec < <(provision_pathspec)
-if [[ -n "$(git -C "$worktree" status --porcelain -- "${wt_pathspec[@]}")" ]]; then
-  if [[ $role == review ]]; then
-    review_note="reviewer modified $(git -C "$worktree" status --porcelain -- "${wt_pathspec[@]}" | wc -l) file(s); changes discarded"
-    git -C "$worktree" reset -q --hard
-    git -C "$worktree" clean -qfd -- "${wt_pathspec[@]}"
-  else
-    git -C "$worktree" add -A -- "${wt_pathspec[@]}" >/dev/null 2>&1
-    git -C "$worktree" -c user.name=oc-task -c user.email=oc-task@localhost \
-        commit -q -m "oc-task: uncommitted changes at end of run $run_id" >/dev/null 2>&1 || true
-  fi
-fi
-# This run's diff: from the worktree HEAD before dispatch to after. For the
-# first run on a branch that equals the branch diff; later runs (tasks 2..N in
-# the same worktree) get just their own task's changes — the review package.
-{ echo "# run $run_id  ${start_sha:0:7}..$(git rev-parse --short "$branch")  (branch base ${base_sha:0:7})"; echo "# commits:";
-  git log --oneline "$start_sha..$branch" | sed 's/^/#   /'; echo; git diff -U10 "$start_sha" "$branch"; } > "$diff_out" 2>/dev/null || true
-numstat=$(git diff --numstat "$start_sha" "$branch" 2>/dev/null || true)
-head_sha=$(git rev-parse --short "$branch" 2>/dev/null || echo "")
-[[ "$(git rev-parse "$branch")" != "$start_sha" ]] || head_sha=""
-
-text=$(jq -r 'select(.type=="text") | .part.text // empty' "$log" 2>/dev/null || true)
-result=$(awk '/^## RESULT[[:space:]]*$/ {buf=""; on=1} on {buf = buf $0 "\n"} END {printf "%s", buf}' <<<"$text")
-errors=$(jq -r 'select(.type=="error") | (.error.name // "error") + ": " + (.error.data.message // (.error.data|tostring) // (.error|tostring))' "$log" 2>/dev/null | head -5 || true)
-[[ -n "$errors" ]] || errors=$(grep -vE '^\{' "$log" | grep -iE 'error|fail' | head -3 || true)
-err_events=$(jq -r 'select(.type=="error") | .type' "$log" 2>/dev/null || true)
-
-status=$EX_OK; status_txt="success"; dead=false; dead_reason=""
-resume_hint="re-dispatch with --session new --branch $branch (checkpoint ${head_sha:-${base_sha:0:7}})"
-if grep -qiE "$IMAGE_LIMIT_RE" <<<"$errors" || { [[ $oc_exit -ne 0 ]] && grep -qiE "$IMAGE_LIMIT_RE" "$log"; }; then
-  status=$EX_IMAGES; dead=true; dead_reason="image-limit"
-  status_txt="session poisoned by image limit — not resumable. $resume_hint"
-elif [[ $stalled -eq 1 ]]; then
-  status=$EX_STALL; dead=true; dead_reason="stalled"
-  status_txt="stalled — no output for ${idle_timeout}s, run killed. Killing a run poisons its session, so it is not resumable: $resume_hint"
-elif grep -qiE "$POISON_RE" <<<"$errors" || { [[ $oc_exit -ne 0 ]] && grep -qiE "$POISON_RE" "$log"; }; then
-  status=$EX_IMAGES; dead=true; dead_reason="encrypted-content"
-  status_txt="session poisoned — the provider rejected this session's reasoning state (encrypted_content), which an interrupted turn always causes. not resumable: $resume_hint"
-elif [[ $oc_exit -ne 0 ]] || { [[ -n "$err_events" ]] && [[ -z "$result" ]]; }; then
-  if grep -iqE "$RATE_LIMIT_RE" <<<"$errors"; then status=$EX_RATE; status_txt="rate limited by the provider — retry later, do not loop"
-  else status=$EX_ERR; status_txt="opencode errored"; fi
-elif [[ -z "$numstat" && $role == implement ]]; then
-  status=$EX_NOCHANGE; status_txt="completed but produced zero changes"
-elif [[ $role == review && -z "$result" ]]; then
-  status=$EX_ERR; status_txt="review finished without a ## RESULT block"
-fi
-if [[ "$dead" == true ]]; then
-  jq -cn --arg s "$session" --arg r "$run_id" --arg reason "$dead_reason" \
-     '{type:"oc-task",event:"session-dead",reason:$reason,session_id:$s,run_id:$r}' >> "$log"
-fi
-
-# The `|| true` keeps `set -euo pipefail` from exiting when the provision file
-# does not exist yet: the missing-file test on the left then fails the whole
-# pipeline even though jq still prints `[]` for the empty input.
-prov_file=$(provision_file)
-provisioned_json=$( { [[ -f "$prov_file" ]] && cat "$prov_file"; } 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))' || true )
-[[ -n "$provisioned_json" ]] || provisioned_json='[]'
-
-jq -n --arg run_id "$run_id" --arg branch "$branch" --arg worktree "$worktree" \
-      --arg base_branch "$base_branch" --arg base_sha "$base_sha" --arg model "$model" \
-      --arg spec "$spec_rel" --arg role "$role" --arg start_sha "$start_sha" \
-      --arg session_id "$session" --argjson exit_code "$status" \
-      --argjson oc_exit "$oc_exit" --argjson duration "$duration" --argjson dead "$dead" \
-      --arg dead_reason "$dead_reason" --argjson stalled "$stalled" \
-      --argjson idle_timeout "$idle_timeout" \
-      --argjson provisioned "$provisioned_json" \
-      --arg head_sha "$head_sha" --arg result "$result" --arg log "$log" --arg diff "$diff_out" \
-      '$ARGS.named' > "$rec_out"
-
-# ---------------------------------------------------------------- summary (stdout only)
-echo "run:      $run_id  (role: $role)"
-echo "session:  $session"
-echo "model:    $model"
-echo "exit:     $status ($status_txt)"
-echo "duration: $(fmt_duration "$duration")"
-echo "branch:   $branch  (worktree $WORKTREES_DIR/$branch, base $base_branch @ ${base_sha:0:7})"
-echo "checkpoint: ${head_sha:-none}"
-[[ -z "$review_note" ]] || echo "warning:  $review_note"
-if [[ -n "$numstat" ]]; then
-  echo "files:"; awk '$1=="-" {printf "  binary  %s\n", $3; next} {printf "  +%s -%s  %s\n", $1, $2, $3}' <<<"$numstat"
-else
-  echo "files:    none"
-fi
-[[ -z "$errors" ]] || { echo "errors:"; sed 's/^/  /' <<<"$errors" | cut -c1-400; }
-if [[ -n "$result" ]]; then echo "$result"; else echo "## RESULT: (none — model did not emit a RESULT block)"; fi
-echo "log:  $RUNS_DIR/$run_id.log"
-echo "diff: $RUNS_DIR/$run_id.diff"
+finalize
 exit "$status"

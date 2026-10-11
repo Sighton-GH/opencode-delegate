@@ -174,8 +174,10 @@ run_oc --brief "$brief" --branch oc/prov --copy-untracked inputs
 eq "the dispatch succeeds" 0 "$STATUS"
 wt="$FIX_REPO/.oc-worktrees/oc/prov"
 eq "the untracked input is in the worktree" "untracked input" "$(cat "$wt/inputs/raw.md" 2>/dev/null)"
-[[ -L "$wt/node_modules" ]] && ok "node_modules is linked into the worktree" \
-  || no "node_modules is linked into the worktree" "a symlink" "$(ls -ld "$wt/node_modules" 2>&1)"
+[[ -d "$wt/node_modules" && ! -L "$wt/node_modules" ]] && ok "the worktree gets its own node_modules directory" \
+  || no "the worktree gets its own node_modules directory" "a real directory" "$(ls -ld "$wt/node_modules" 2>&1)"
+[[ -L "$wt/node_modules/dep.js" ]] && ok "its entries link to the base checkout's packages" \
+  || no "its entries link to the base checkout's packages" "a symlink" "$(ls -ld "$wt/node_modules/dep.js" 2>&1)"
 eq "the link resolves to the base checkout's node_modules" "dep" \
   "$(cat "$wt/node_modules/dep.js" 2>/dev/null | tr -d '\n')"
 
@@ -226,8 +228,8 @@ contains "the review run says it discarded changes" "changes discarded" "$OUT"
   && no "the review run discards the reviewer's stray file" "absent" "present" \
   || ok "the review run discards the reviewer's stray file"
 eq "the review run keeps the provisioned input" "untracked input" "$(cat "$wt/inputs/raw.md" 2>/dev/null)"
-[[ -L "$wt/node_modules" ]] && ok "the review run keeps the node_modules link" \
-  || no "the review run keeps the node_modules link" "a symlink" "$(ls -ld "$wt/node_modules" 2>&1)"
+[[ -L "$wt/node_modules/dep.js" ]] && ok "the review run keeps the linked node_modules" \
+  || no "the review run keeps the linked node_modules" "a symlink" "$(ls -ld "$wt/node_modules/dep.js" 2>&1)"
 
 new_fixture noprovision
 brief="$FIX_ROOT/brief.md"; write_brief "$brief"
@@ -411,5 +413,414 @@ brief="$FIX_ROOT/brief.md"; write_brief "$brief"
 run_oc --brief "$brief" --branch oc/mo --no-commit --dry-run
 neq "--no-commit outside --merge is refused" 0 "$STATUS"
 contains "and says so" "--merge" "$OUT"
+
+# ======================================================== v0.5.0 (field report v0.4.0)
+# The watchdog polls every OC_TASK_POLL seconds; one keeps these tests quick.
+export OC_TASK_POLL=1
+
+section "v0.5 helpers"
+OC_TASK_SOURCE_ONLY=1 . "$OC_TASK"
+set +eu +o pipefail
+tmpf=$(mktemp)
+printf '%s\n' \
+  'timestamp=x level=WARN message=hello' \
+  'timestamp=x level=ERROR run=1 message="stream error" session.id=ses_a error.error="AI_APICallError: Rate limit exceeded. Please try again later."' \
+  'timestamp=x level=ERROR message="share subscriber failed" cause="noise"' \
+  'timestamp=x level=ERROR message=process session.id=ses_a error="Failed to execute statement" stack="Error"' >"$tmpf"
+printf 'timestamp=x level=ERROR message="stream error" error.error="half a li' >>"$tmpf"
+serrs=$(serve_errors "$tmpf")
+contains "serve_errors reads a provider's stream error" "Rate limit exceeded" "$serrs"
+contains "serve_errors reads opencode's own errors" "Failed to execute statement" "$serrs"
+lacks "serve_errors drops share-subscriber noise" "noise" "$serrs"
+lacks "serve_errors leaves a half-written last line for the next look" "half a li" "$serrs"
+
+printf '%s\n' '{"type":"text","part":{"id":"a","text":"first"}}' 'plain stderr noise' \
+  '{"type":"error","error":{"name":"APIError","data":{"message":"after the noise"}}}' \
+  '{"type":"text","part":{"id":"b","text":"## RESULT\nStatus: DONE"}}' >"$tmpf"
+contains "run_text reads past a non-JSON line" "Status: DONE" "$(run_text "$tmpf")"
+contains "run_errors reads past a non-JSON line" "after the noise" "$(run_errors "$tmpf")"
+eq "model_event_count ignores errors" "2" "$(model_event_count "$tmpf")"
+eq "limit_reset finds a reset time" "Resets in 3h 51m" "$(limit_reset 'AI_APICallError: Usage limit reached. Resets in 3h 51m.')"
+eq "dedouble_result collapses a block whose every line is doubled" \
+  "$(printf '## RESULT\nStatus: DONE\nFiles changed: a')" \
+  "$(printf '## RESULT\nStatus: DONE\nStatus: DONE\nFiles changed: a\nFiles changed: a\n' | dedouble_result)"
+eq "dedouble_result leaves an ordinary block alone" \
+  "$(printf '## RESULT\nStatus: DONE\n- none\n- none\nFiles changed: a')" \
+  "$(printf '## RESULT\nStatus: DONE\n- none\n- none\nFiles changed: a\n' | dedouble_result)"
+
+cat >"$tmpf" <<'SPEC'
+# Files
+- `packages/dashboard/src/pages/assistant.tsx`, `assistant-skills.tsx`, `./docs/x.md`
+SPEC
+tokens=$(spec_file_tokens "$tmpf" | tr '\n' ' ')
+contains "a bare filename resolves against the previous path's directory" "packages/dashboard/src/pages/assistant-skills.tsx" "$tokens"
+contains "a leading ./ is dropped" "docs/x.md" "$tokens"
+rm -f "$tmpf"
+
+section "help and argument checks"
+new_fixture help
+run_oc --help
+eq "--help exits 0" 0 "$STATUS"
+for flag in --base --continue-from --install --no-link-node-modules --link-node-modules --idle-timeout --copy-untracked; do
+  contains "--help lists $flag" "$flag" "$OUT"
+done
+contains "--help lists exit 7" "7  opencode's local database" "$OUT"
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+run_oc --brief "$brief" --session ses_nope
+eq "resuming a session with no record exits 1, not 0 (finding #16)" 1 "$STATUS"
+contains "and says how to start fresh" "--session new" "$OUT"
+OC_STUB_MODELS_PAD=20000 run_oc --brief "$brief" --dry-run
+eq "a long catalog does not make the listed model look missing" 0 "$STATUS"
+
+section "brief validation names every missing section (evaluation D44)"
+printf '# Objective\nonly this\n' >"$FIX_ROOT/thin.md"
+run_oc --brief "$FIX_ROOT/thin.md" --dry-run
+contains "it names # Files" "missing section: # Files" "$OUT"
+contains "and # Verification in the same refusal" "missing section: # Verification" "$OUT"
+
+section "the record exists from dispatch; a killed wrapper still reports (#1, #4, #16, #22)"
+new_fixture killed
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+( cd "$FIX_REPO" && OC_STUB_RUN_MODE=stall PATH="$FIX_BIN:$PATH" exec bash "$OC_TASK" --brief "$brief" --branch oc/killed --idle-timeout 120 >"$FIX_ROOT/bg.out" 2>&1 ) &
+bg=$!
+rec=""
+for _ in $(seq 1 100); do rec=$(ls "$FIX_REPO/.oc-runs"/*.json 2>/dev/null | tail -1); [[ -n "$rec" ]] && break; sleep 0.1; done
+eq "the record exists while the run is live" "running" "$(jq -r .state "$rec" 2>/dev/null)"
+eq "and already holds the session id" "ses_stub0000000000000000" "$(jq -r .session_id "$rec" 2>/dev/null)"
+run_oc --brief "$brief" --branch oc/killed --session new --dry-run
+neq "a second run in a live worktree is refused" 0 "$STATUS"
+contains "the refusal says another run is live" "another oc-task run is live" "$OUT"
+OC_STUB_RUN_MODE=nochange run_oc --brief "$brief" --branch oc/beside
+contains "a dispatch beside a live run on the same model warns" "already use opencode/muse-spark-1.3-contributor-free" "$OUT"
+kill -TERM "$bg"; wait "$bg" && bg_status=0 || bg_status=$?
+eq "SIGTERM exits 143" 143 "$bg_status"
+contains "the killed run still prints its summary" "killed by SIGTERM" "$(cat "$FIX_ROOT/bg.out")"
+eq "the record is final" "done" "$(jq -r .state "$rec")"
+eq "and holds the exit code" "143" "$(jq -r .exit_code "$rec")"
+[[ -s "${rec%.json}.summary" ]] && ok "the summary is saved beside the record" \
+  || no "the summary is saved beside the record" "a .summary file" "none"
+left=$(ps -eo args= | grep -F -- "--dir $FIX_REPO/.oc-worktrees/oc/killed" | grep -v grep || true)
+eq "no opencode process outlives the killed wrapper" "" "$left"
+run_oc --brief "$brief" --branch oc/killed --session new --dry-run
+eq "the lock goes with the wrapper" 0 "$STATUS"
+run_oc --brief "$brief" --session ses_stub0000000000000000 --dry-run
+eq "the killed run's session can be resumed from its record" 0 "$STATUS"
+
+section "provider errors in the server's log (#1, #3, #12, #15, #19, #24)"
+new_fixture srvrate
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+started=$(date +%s)
+OC_STUB_RUN_MODE=stall OC_DELEGATE_RATE_LIMIT_GRACE=2 \
+  OC_STUB_SERVE_ERROR="AI_APICallError: Error from provider (Console): Rate limit exceeded. Please try again later." \
+  run_oc --brief "$brief" --branch oc/srvrate --idle-timeout 120
+elapsed=$(( $(date +%s) - started ))
+eq "a rate limit in the server log exits 5" 5 "$STATUS"
+contains "the summary carries the provider's message" "Rate limit exceeded" "$OUT"
+lacks "and no internal-error line" "internal error" "$OUT"
+[[ $elapsed -lt 30 ]] && ok "within the grace, not the idle timeout (${elapsed}s)" \
+  || no "within the grace, not the idle timeout" "<30s" "${elapsed}s"
+contains "--print-logs is how the server reports it" "--print-logs" "$(cat "$FIX_STUB_STATE/serve-args")"
+[[ -s "$(ls "$FIX_REPO/.oc-runs"/*.serve.log | tail -1)" ]] && ok "the server log is kept with the run" \
+  || no "the server log is kept with the run" "a .serve.log" "none"
+
+new_fixture srvusage
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+started=$(date +%s)
+OC_STUB_RUN_MODE=stall OC_DELEGATE_RATE_LIMIT_GRACE=600 \
+  OC_STUB_SERVE_ERROR="AI_APICallError: Usage limit reached. Resets in 3h 51m." \
+  run_oc --brief "$brief" --branch oc/srvusage --idle-timeout 120
+elapsed=$(( $(date +%s) - started ))
+eq "a usage limit exits 5" 5 "$STATUS"
+contains "and prints when it resets" "reset:    Resets in 3h 51m" "$OUT"
+[[ $elapsed -lt 20 ]] && ok "at once, without waiting out the grace (${elapsed}s)" \
+  || no "at once, without waiting out the grace" "<20s" "${elapsed}s"
+
+new_fixture srvrecover
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=slowok OC_STUB_RUN_PAUSE=4 OC_DELEGATE_RATE_LIMIT_GRACE=15 \
+  OC_STUB_SERVE_ERROR="AI_APICallError: Rate limit exceeded. Please retry after a brief wait." \
+  run_oc --brief "$brief" --branch oc/srvrecover --idle-timeout 120
+eq "a run that recovers from a rate limit still succeeds" 0 "$STATUS"
+contains "and the recovered error is still shown" "server: AI_APICallError" "$OUT"
+
+new_fixture stallrate
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=stall OC_DELEGATE_RATE_LIMIT_GRACE=600 \
+  OC_STUB_SERVE_ERROR="AI_APICallError: Rate limit exceeded." \
+  run_oc --brief "$brief" --branch oc/stallrate --idle-timeout 3
+eq "a stall with a rate limit behind it exits 5, not 6" 5 "$STATUS"
+contains "and says the run went quiet after it" "went quiet" "$OUT"
+
+new_fixture silent
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=silent run_oc --brief "$brief" --branch oc/silent --idle-timeout 3
+eq "a run with no model output at all exits 5 (#39, #41)" 5 "$STATUS"
+contains "and says so" "no model output at all" "$OUT"
+rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
+eq "its session is not marked dead" "false" "$(jq -r .dead "$rec")"
+
+new_fixture titlerate
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=stall OC_DELEGATE_RATE_LIMIT_GRACE=2 OC_STUB_SERVE_ERROR_SMALL=1 \
+  OC_STUB_SERVE_ERROR="AI_APICallError: Rate limit exceeded." \
+  run_oc --brief "$brief" --branch oc/titlerate --idle-timeout 8
+eq "a rate limit on the title agent does not end the run as 5" 6 "$STATUS"
+
+section "errors in the run's own stream (#14, #21, D41)"
+for mode in usage dbbusy; do
+  new_fixture "rl-$mode"
+  brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+  OC_STUB_RUN_MODE=$mode run_oc --brief "$brief" --branch "oc/$mode"
+  case $mode in
+    usage)  eq "a usage limit in the run log exits 5" 5 "$STATUS"
+            contains "with its reset time" "Resets in 3h 51m" "$OUT" ;;
+    dbbusy) eq "opencode's busy database exits 7" 7 "$STATUS"
+            contains "and names the cause" "database was busy" "$OUT" ;;
+  esac
+done
+
+new_fixture errhang
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+started=$(date +%s)
+OC_STUB_RUN_MODE=errhang OC_DELEGATE_ERROR_GRACE=2 run_oc --brief "$brief" --branch oc/errhang --idle-timeout 120
+elapsed=$(( $(date +%s) - started ))
+eq "an error event followed by silence exits 1" 1 "$STATUS"
+contains "it names the error" "ECONNRESET" "$OUT"
+[[ $elapsed -lt 30 ]] && ok "after the error grace, not the idle timeout (${elapsed}s)" \
+  || no "after the error grace, not the idle timeout" "<30s" "${elapsed}s"
+
+new_fixture noisy
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=noisy run_oc --brief "$brief" --branch oc/noisy
+eq "a stderr line in the log does not hide the RESULT" 0 "$STATUS"
+contains "the RESULT block is found" "Status: DONE" "$OUT"
+
+new_fixture dup
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=dup run_oc --brief "$brief" --branch oc/dup
+eq "a doubled RESULT block is printed once (#9)" 1 "$(grep -c '^Status: DONE' <<<"$OUT")"
+
+new_fixture needsctx
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=needsctx run_oc --brief "$brief" --branch oc/needsctx
+eq "a NEEDS_CONTEXT with no heading still exits 3" 3 "$STATUS"
+contains "the exit line names NEEDS_CONTEXT (#20)" "stopped with NEEDS_CONTEXT" "$OUT"
+contains "and shows the model's question" "which config file" "$OUT"
+lacks "a normal non-zero exit prints no internal-error line" "internal error" "$OUT"
+
+section "the collect phase reports instead of dying (#27, #29)"
+new_fixture stage
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=stage run_oc --brief "$brief" --branch oc/stage
+contains "a failed checkpoint is reported" "checkpoint failed (git add)" "$OUT"
+contains "and the summary is still printed" "## RESULT" "$OUT"
+rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
+eq "and the record is still written" "done" "$(jq -r .state "$rec")"
+
+new_fixture ctrl
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=ctrl run_oc --brief "$brief" --branch oc/ctrl
+contains "a diff that adds raw control bytes is flagged (#17)" "gained raw control bytes" "$OUT"
+
+section "the stash is off limits (#13)"
+new_fixture stash
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=nochange run_oc --brief "$brief" --branch oc/stash
+body=$(tail -1 "$FIX_STUB_STATE/session-body")
+eq "the blanket allow comes first" "allow" "$(jq -r '.permission[0].action' <<<"$body")"
+eq "git stash is denied after it, so the denial wins" "deny" \
+  "$(jq -r '.permission[] | select(.pattern == "*git stash*") | .action' <<<"$body")"
+eq "git -C <dir> stash is denied too" "deny" \
+  "$(jq -r '.permission[] | select(.pattern == "*git -C * stash*") | .action' <<<"$body")"
+
+section "--base and existing branches (#11, 2026-10-01, 2026-10-10)"
+new_fixture base
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+cur=$(git -C "$FIX_REPO" symbolic-ref --short HEAD)
+git -C "$FIX_REPO" switch -q -c side
+printf 'side\n' >"$FIX_REPO/side.txt"; git -C "$FIX_REPO" add side.txt; git -C "$FIX_REPO" commit -q -m side
+side_sha=$(git -C "$FIX_REPO" rev-parse side)
+git -C "$FIX_REPO" switch -q "$cur"
+run_oc --brief "$brief" --branch oc/based --base side
+eq "a run forked from --base succeeds" 0 "$STATUS"
+eq "the worktree starts from that ref" "side" "$(cat "$FIX_REPO/.oc-worktrees/oc/based/side.txt" 2>/dev/null)"
+rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
+eq "the record's base is the ref" "$side_sha" "$(jq -r .base_sha "$rec")"
+eq "and it still merges into the checkout's branch" "$cur" "$(jq -r .base_branch "$rec")"
+diffout=$(cd "$FIX_REPO" && PATH="$FIX_BIN:$PATH" bash "$OC_TASK" --branch-diff --branch oc/based 2>/dev/null) || true
+lacks "the branch diff leaves out the base's own commits" "side.txt" "$(cat "$diffout" 2>/dev/null)"
+contains "and shows the run's" "stub-output.txt" "$(cat "$diffout" 2>/dev/null)"
+run_oc --brief "$brief" --branch oc/x --base nope-not-a-ref
+neq "an unknown --base is refused" 0 "$STATUS"
+run_oc --brief "$brief" --base side --session new --branch oc/based
+neq "--base with --session is refused" 0 "$STATUS"
+
+new_fixture adopt
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+cur=$(git -C "$FIX_REPO" symbolic-ref --short HEAD)
+git -C "$FIX_REPO" switch -q -c tool/branch
+printf 'other\n' >"$FIX_REPO/other.txt"; git -C "$FIX_REPO" add other.txt; git -C "$FIX_REPO" commit -q -m other
+git -C "$FIX_REPO" switch -q "$cur"
+run_oc --brief "$brief" --branch tool/branch
+neq "a fresh dispatch on an existing branch is still refused" 0 "$STATUS"
+contains "and points at --session new" "--session new --branch tool/branch" "$OUT"
+run_oc --brief "$brief" --branch tool/branch --session new --dry-run
+eq "--session new adopts an existing branch that has no worktree" 0 "$STATUS"
+contains "and says it will make one" "new, for the existing branch" "$OUT"
+run_oc --brief "$brief" --branch tool/branch --session new
+eq "the adopted branch runs" 0 "$STATUS"
+eq "in a worktree of that branch" "other" "$(cat "$FIX_REPO/.oc-worktrees/tool/branch/other.txt" 2>/dev/null)"
+
+new_fixture regone
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+run_oc --brief "$brief" --branch oc/gone
+eq "[regone] setup dispatch succeeded" 0 "$STATUS"
+rm -rf "$FIX_REPO/.oc-worktrees/oc/gone"
+OC_STUB_RUN_MODE=nochange run_oc --brief "$brief" --branch oc/gone --session new
+eq "a worktree deleted by hand is re-created for its surviving branch" 3 "$STATUS"
+[[ -d "$FIX_REPO/.oc-worktrees/oc/gone" ]] && ok "and the worktree is back" \
+  || no "and the worktree is back" "a worktree" "none"
+
+new_fixture stalelock
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+run_oc --brief "$brief" --branch oc/stale
+printf '999999 dead-run\n' >"$(git -C "$FIX_REPO/.oc-worktrees/oc/stale" rev-parse --git-dir)/oc-task.lock"
+OC_STUB_RUN_MODE=nochange run_oc --brief "$brief" --branch oc/stale --session new
+eq "a lock left by a dead wrapper is replaced" 3 "$STATUS"
+
+new_fixture adoptfail
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+git -C "$FIX_REPO" branch keep/me
+OC_STUB_SESSION_STATUS=500 run_oc --brief "$brief" --branch keep/me --session new
+neq "a failed dispatch on an adopted branch fails" 0 "$STATUS"
+git -C "$FIX_REPO" show-ref --verify --quiet refs/heads/keep/me \
+  && ok "and never deletes the branch it did not create" \
+  || no "and never deletes the branch it did not create" "branch kept" "branch deleted"
+
+section "continuation briefs (#6, #23)"
+new_fixture cont
+parent="$FIX_ROOT/parent.md"; write_brief "$parent"
+cont="$FIX_ROOT/cont.md"
+printf '# Objective\nContinue from step 2.\n\n# Tasks\n2. Finish.\n' >"$cont"
+run_oc --brief "$cont" --branch oc/cont --dry-run
+eq "a short continuation brief alone is rejected" 2 "$STATUS"
+run_oc --brief "$cont" --continue-from "$parent" --branch oc/cont --dry-run
+eq "with --continue-from it is accepted" 0 "$STATUS"
+contains "the dry run names the parent" "parent:" "$OUT"
+run_oc --brief "$cont" --continue-from "$parent" --branch oc/cont
+eq "the continuation dispatches" 0 "$STATUS"
+prompt=$(cat "$FIX_STUB_STATE/last-prompt" 2>/dev/null) || true
+contains "the model gets the continuation" "Continue from step 2." "$prompt"
+contains "and the parent below it" "Parent brief (for reference)" "$prompt"
+contains "with the parent's sections" "# Verification" "$prompt"
+run_oc --merge --branch oc/cont --verified "true"
+eq "the merge audit accepts files the parent brief names" 0 "$STATUS"
+
+new_fixture runningrec
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+run_oc --brief "$brief" --branch oc/rr
+rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
+jq '.state = "running" | .exit_code = null' "$rec" >"$rec.new" && mv "$rec.new" "$rec"
+run_oc --merge --branch oc/rr --verified "true"
+neq "a run that never finished is not merged" 0 "$STATUS"
+contains "and the refusal says why" "never finished" "$OUT"
+
+section "node_modules: its own directory, workspace-aware (#7, #37, D52, D55)"
+new_fixture workspace
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+mkdir -p "$FIX_REPO/packages/pkg" "$FIX_REPO/packages/app"
+printf '{"name":"@ws/pkg"}\n' >"$FIX_REPO/packages/pkg/package.json"
+printf '{"name":"app"}\n' >"$FIX_REPO/packages/app/package.json"
+printf 'node_modules/\n' >"$FIX_REPO/.gitignore"
+git -C "$FIX_REPO" add -A; git -C "$FIX_REPO" commit -q -m workspace
+mkdir -p "$FIX_REPO/node_modules/@ws" "$FIX_REPO/node_modules/.bin" "$FIX_REPO/node_modules/dep" \
+  "$FIX_REPO/node_modules/.cache/tool" "$FIX_REPO/packages/app/node_modules/nested"
+printf 'dep\n' >"$FIX_REPO/node_modules/dep/index.js"
+ln -s ../../packages/pkg "$FIX_REPO/node_modules/@ws/pkg"
+ln -s ../dep/index.js "$FIX_REPO/node_modules/.bin/dep"
+printf 'nested\n' >"$FIX_REPO/packages/app/node_modules/nested/index.js"
+run_oc --brief "$brief" --branch oc/ws
+eq "a workspace dispatch succeeds" 0 "$STATUS"
+wt="$FIX_REPO/.oc-worktrees/oc/ws"
+eq "a workspace package resolves to the worktree's own copy" "$wt/packages/pkg" "$(readlink -f "$wt/node_modules/@ws/pkg")"
+eq "a third-party package resolves to the base checkout" "$FIX_REPO/node_modules/dep" "$(readlink -f "$wt/node_modules/dep")"
+eq ".bin entries resolve" "dep" "$(cat "$wt/node_modules/.bin/dep" 2>/dev/null)"
+eq "a nested workspace install is linked too" "nested" "$(cat "$wt/packages/app/node_modules/nested/index.js" 2>/dev/null)"
+[[ -e "$wt/node_modules/.cache" ]] && no "tool caches stay per checkout" "absent" "present" \
+  || ok "tool caches stay per checkout"
+tracked=$(git -C "$wt" log --name-only --pretty=format: | sort -u | grep -E 'node_modules' || true)
+eq "nothing linked was committed" "" "$tracked"
+# What `npm ci` does first: empty node_modules through whatever path it has.
+find "$wt/node_modules/" "$wt/packages/app/node_modules/" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+eq "emptying the worktree's node_modules leaves the base checkout's intact" "dep" "$(cat "$FIX_REPO/node_modules/dep/index.js" 2>/dev/null)"
+eq "and its nested install" "nested" "$(cat "$FIX_REPO/packages/app/node_modules/nested/index.js" 2>/dev/null)"
+
+new_fixture install
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+printf '{"name":"x"}\n' >"$FIX_REPO/package.json"
+printf '{"name":"x","lockfileVersion":3}\n' >"$FIX_REPO/package-lock.json"
+printf 'node_modules/\n' >"$FIX_REPO/.gitignore"
+git -C "$FIX_REPO" add -A; git -C "$FIX_REPO" commit -q -m npm
+cat >"$FIX_BIN/npm" <<'NPM'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$OC_STUB_STATE/npm-args"
+mkdir -p node_modules/installed && printf 'here\n' >node_modules/installed/marker
+NPM
+chmod +x "$FIX_BIN/npm"
+run_oc --brief "$brief" --branch oc/inst --install
+eq "--install dispatches" 0 "$STATUS"
+contains "it runs the lockfile's clean install" "ci" "$(cat "$FIX_STUB_STATE/npm-args" 2>/dev/null)"
+eq "in the worktree" "here" "$(cat "$FIX_REPO/.oc-worktrees/oc/inst/node_modules/installed/marker" 2>/dev/null)"
+rec=$(ls "$FIX_REPO/.oc-runs"/*.json | tail -1)
+contains "and records node_modules as provisioned" "node_modules" "$(jq -c .provisioned "$rec")"
+
+new_fixture installsig
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+printf '{"name":"x"}\n' >"$FIX_REPO/package.json"
+printf '{"name":"x","lockfileVersion":3}\n' >"$FIX_REPO/package-lock.json"
+git -C "$FIX_REPO" add -A; git -C "$FIX_REPO" commit -q -m npm
+cat >"$FIX_BIN/npm" <<'NPM'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$OC_STUB_STATE/npm-args"
+sleep 30
+NPM
+chmod +x "$FIX_BIN/npm"
+( cd "$FIX_REPO" && PATH="$FIX_BIN:$PATH" exec bash "$OC_TASK" --brief "$brief" --branch oc/instsig --install >"$FIX_ROOT/sig.out" 2>&1 ) &
+sigpid=$!
+for _ in $(seq 1 100); do [[ -f "$FIX_STUB_STATE/npm-args" ]] && break; sleep 0.1; done
+kill -TERM "$sigpid"; wait "$sigpid" && sig_status=0 || sig_status=$?
+eq "a signal during --install exits 143" 143 "$sig_status"
+[[ -e "$FIX_REPO/.oc-worktrees/oc/instsig" ]] && no "and removes the worktree it made" "absent" "present" \
+  || ok "and removes the worktree it made"
+git -C "$FIX_REPO" show-ref --verify --quiet refs/heads/oc/instsig \
+  && no "and the branch it made" "deleted" "kept" || ok "and the branch it made"
+
+new_fixture nonm
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+printf '{"name":"x"}\n' >"$FIX_REPO/package.json"
+git -C "$FIX_REPO" add -A; git -C "$FIX_REPO" commit -q -m pkg
+OC_STUB_RUN_MODE=nochange run_oc --brief "$brief" --branch oc/nonm
+contains "a package with no node_modules to link says so (#26)" "has no node_modules" "$OUT"
+
+section "opencode's database size"
+new_fixture dbwarn
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+mkdir -p "$XDG_DATA_HOME/opencode"; printf 'x' >"$XDG_DATA_HOME/opencode/opencode.db"
+OC_DELEGATE_DB_WARN_GB=0 OC_STUB_RUN_MODE=nochange run_oc --brief "$brief" --branch oc/db
+contains "a large opencode database is reported" "opencode's database is" "$OUT"
+
+section "oc-models (#8, #31, #34)"
+new_fixture models
+mout=$(cd "$FIX_REPO" && PATH="$FIX_BIN:$PATH" bash "$BIN_DIR/oc-models" --free --verbose 2>&1) && mst=0 || mst=$?
+eq "oc-models --free --verbose exits 0" 0 "$mst"
+contains "it lists the free model" "opencode/muse-spark-1.3-contributor-free" "$mout"
+lacks "and leaves out the paid one" "paid-model" "$mout"
+lacks "with no parse error" "parse error" "$mout"
+mout=$(cd "$FIX_REPO" && PATH="$FIX_BIN:$PATH" bash "$BIN_DIR/oc-models" 2>&1)
+eq "free models sort first" "opencode/muse-spark-1.3-contributor-free" "$(head -1 <<<"$mout")"
+mout=$(cd "$FIX_REPO" && OC_STUB_MODELS_VERBOSE=truncated PATH="$FIX_BIN:$PATH" bash "$BIN_DIR/oc-models" --free 2>&1) && mst=0 || mst=$?
+eq "a catalog that does not parse exits 3, not 5" 3 "$mst"
+contains "and says so" "did not parse" "$mout"
+lacks "and lists nothing from a partial catalog" "muse-spark" "$mout"
 
 summary

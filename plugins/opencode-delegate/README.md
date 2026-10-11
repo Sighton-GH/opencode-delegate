@@ -8,7 +8,12 @@ with opencode in every subagent seat.
 
 Full docs, install steps, the worked example, and troubleshooting are in the
 [repository README](../../README.md). This file is the short version for
-someone who already has the plugin enabled.
+someone who already has the plugin enabled. To install it (Claude Code
+2.1.275 or later):
+
+```
+/plugin install opencode-delegate --marketplace Sighton-GH/opencode-delegate
+```
 
 ## What you get
 
@@ -45,14 +50,19 @@ refuses any id not in the live catalog.
 
 0 success · 1 opencode/setup error · 2 brief rejected · 3 zero changes
 (implement) · 4 session unrecoverable — image limit or a poisoned reasoning
-state (never retried) · 5 rate limited · 6 stalled (no output for the idle
-timeout; session dead). Non-zero exits leave the worktree in place, except a
-dispatch that fails before a session exists, which removes what it created.
+state (never retried) · 5 rate or usage limited, or no model output at all ·
+6 stalled (output, then none for the idle timeout; session dead) · 7
+opencode's database busy · 128+N killed by a signal. Non-zero exits leave the
+worktree in place, except a dispatch that fails before a session exists,
+which removes what it created. Every run writes
+`.oc-runs/RUNID.{json,summary,diff,log,serve.log}`; the record exists from
+dispatch, and every exit path writes the summary.
 
 ## Safety model
 
 Permissions are auto-approved for implement sessions only because they run
-in a throwaway worktree; reviewers run opencode's read-only agent. The base
+in a throwaway worktree, with one denial: `git stash`, whose stack every
+worktree of a repository shares; reviewers run opencode's read-only agent. The base
 branch is untouched until `--merge`, which requires your `--verified
 "COMMAND"` attestation and refuses files outside the briefs. `oc-undo`
 reverts a merge in one command. Tasks touching auth, secrets, crypto, or
