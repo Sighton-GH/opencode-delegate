@@ -2,7 +2,7 @@
 
 A Claude Code plugin that runs **opencode-driven development**: Claude
 brainstorms, writes the plan, and writes every brief; [opencode](https://opencode.ai)
-sessions on free models — Muse Spark 1.3 by default — implement each task,
+sessions on free models — Big Pickle by default — implement each task,
 review each task, and review the whole branch. It is a mirror of
 superpowers' `subagent-driven-development` with opencode in every subagent
 seat.
@@ -51,7 +51,7 @@ Install these before the plugin. The plugin does not carry any of them.
 | Tool | Why | Check |
 |---|---|---|
 | Claude Code 2.1+ | plugin host | `claude --version` |
-| [opencode](https://opencode.ai) 1.18+ | runs the models | `opencode --version` |
+| [opencode](https://opencode.ai) 1.18+ or 2.x | runs the models | `opencode --version` |
 | git 2.x | worktrees, merges, reverts | `git --version` |
 | jq | parses opencode's JSON | `jq --version` |
 | curl | talks to opencode's local server | `curl --version` |
@@ -62,6 +62,10 @@ is machine state — a credential file in your home directory — and the plugin
 does not carry it. Run `opencode providers list` and make sure `OpenCode
 Zen` is listed (the free models live there). If it isn't, run
 `opencode auth login` and pick it.
+
+opencode 1.18+ and 2.x are both supported; oc-task detects the major version
+and speaks that API. Under 2.x it authenticates to opencode's local server
+with a per-run password it generates itself — nothing extra to set up.
 
 **Recommended companion:** the `superpowers` plugin. When it is installed
 the skill uses `superpowers:brainstorming`, `superpowers:writing-plans`, and
@@ -204,7 +208,7 @@ oc-task --brief .oc-runs/project-soft-delete/task-1-brief.md --branch oc/project
 ```
 run:      20260912T141530-oc_project-soft-delete  (role: implement)
 session:  ses_f67fcd9c5ffeuPtAzaubTh8qph
-model:    opencode/muse-spark-1.3-contributor-free
+model:    opencode/big-pickle
 exit:     0 (success)
 duration: 3m41s
 branch:   oc/project-soft-delete  (worktree .oc-worktrees/oc/project-soft-delete, base main @ 9c1f2ab)
@@ -341,7 +345,7 @@ differ per role:
 
 Model precedence: `--model` > `$OC_DELEGATE_MODEL` > `model=` line in
 `~/.config/oc-delegate/config` (respects `$XDG_CONFIG_HOME`; created on first
-run) > built-in `opencode/muse-spark-1.3-contributor-free`. Any id not in
+run) > built-in `opencode/big-pickle`. Any id not in
 the live catalog is refused immediately with the current free list.
 
 `--dry-run` prints the resolved model, branch, worktree, and section check
@@ -480,9 +484,9 @@ Unfinished string at EOF` that 0.4.0 printed above a partial list. A catalog
 that still does not parse now exits 3 and lists nothing.
 
 **When the default model disappears.** The skill checks `oc-models --free`
-once per plan. If `opencode/muse-spark-1.3-contributor-free` is gone Claude
-picks the best free replacement using `--verbose`: a newer `muse-spark-*`
-free variant first, otherwise the free model with `toolcall=yes` and the
+once per plan. If `opencode/big-pickle` is gone Claude
+picks the best free replacement using `--verbose`: the free model with
+`toolcall=yes` and the
 largest context window (newest release wins ties), and records the choice
 in the ledger. It never picks a model without tool calling and never falls
 back to a paid one. To pin a replacement yourself, put

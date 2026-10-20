@@ -4,6 +4,10 @@
 # environment variables so one stub serves every scenario.
 #
 #   OC_STUB_STATE            dir this stub records observations into (required)
+#   OC_STUB_VERSION          what `--version` prints (default 1.18.35). Set a
+#                            2.x version and the stub switches to v2 behaviour:
+#                            no --verbose catalog, `api --standalone model.list`
+#                            instead, and run-args gain --server, lose --dir
 #   OC_STUB_SESSION_STATUS   HTTP status for POST /session (default 200)
 #   OC_STUB_SERVE_ERROR      an error message the stub server logs, as opencode
 #                            does, OC_STUB_SERVE_ERROR_DELAY seconds (default 1)
@@ -50,10 +54,42 @@ do_ok() { # $1 = worktree
   emit '{"type":"text","part":{"id":"prt_result","text":"'"$RESULT_TEXT"'"}}'
 }
 
+stub_major=${OC_STUB_VERSION:-1.18.35}
+stub_major=${stub_major%%.*}
+
 case "${1:-}" in
+  --version|-v|version)
+    emit "opencode v${OC_STUB_VERSION:-1.18.35}"
+    exit 0
+    ;;
+
+  api)
+    # The v2 oc-models path: `opencode api --standalone model.list`.
+    printf '%s\n' "$*" >"$state/api-args"
+    if [[ "$stub_major" -lt 2 ]]; then
+      emit "stub-opencode: api needs OC_STUB_VERSION 2.x" >&2
+      exit 127
+    fi
+    emit '{"data":['
+    emit '{"id":"muse-spark-1.3-contributor-free","modelID":"muse-spark-1.3-contributor-free","providerID":"opencode","cost":[{"input":0,"output":0}],"limit":{"context":1048576},"capabilities":{"tools":true,"reasoning":true},"time":{"released":1788393600000}},'
+    emit '{"id":"stub-alternate-free","modelID":"stub-alternate-free","providerID":"opencode","cost":[{"input":0,"output":0}],"limit":{"context":200000},"capabilities":{"tools":true},"time":{"released":1788393600000}},'
+    if [[ "${OC_STUB_MODELS_VERBOSE:-ok}" == truncated ]]; then
+      printf '%s' '{"id":"paid-model","providerID":"opencode","cost":[{"input":1,"outp'
+      exit 0
+    fi
+    emit '{"id":"paid-model","modelID":"paid-model","providerID":"opencode","cost":[{"input":1,"output":2}],"limit":{"context":200000},"capabilities":{"tools":true},"time":{"released":1767225600000}}'
+    emit ']}'
+    exit 0
+    ;;
+
   models)
     # oc-task greps this for an exact match on the configured model id.
     if [[ "${2:-}" == "--verbose" ]]; then
+      if [[ "$stub_major" -ge 2 ]]; then
+        # Real v2 prints help and exits 1: no --verbose flag.
+        emit "stub-opencode: models --verbose does not exist in v2" >&2
+        exit 1
+      fi
       emit 'opencode/muse-spark-1.3-contributor-free'
       emit '{"id":"muse-spark-1.3-contributor-free","providerID":"opencode","cost":{"input":0,"output":0},"limit":{"context":1048576},"capabilities":{"toolcall":true,"reasoning":true},"release_date":"2026-09-02"}'
       emit 'opencode/paid-model'
@@ -66,6 +102,8 @@ case "${1:-}" in
     fi
     emit 'opencode/muse-spark-1.3-contributor-free'
     emit 'opencode/stub-alternate-free'
+    # oc-task's built-in default must pass its own catalog check.
+    emit 'opencode/big-pickle'
     for (( i = 0; i < ${OC_STUB_MODELS_PAD:-0}; i++ )); do emit "pad/model-$i"; done
     exit 0
     ;;

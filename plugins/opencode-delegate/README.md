@@ -2,7 +2,7 @@
 
 opencode-driven development: Claude brainstorms, writes the plan and every
 brief, adjudicates reviews, and merges; opencode sessions on free models
-(Muse Spark 1.3 by default) implement each task, review each task, and
+(Big Pickle by default) implement each task, review each task, and
 review the whole branch. A mirror of superpowers' subagent-driven-development
 with opencode in every subagent seat.
 
@@ -42,7 +42,7 @@ falls back to built-in equivalents without it.
 
 Free only. `--model` > `$OC_DELEGATE_MODEL` > `model=` in
 `~/.config/oc-delegate/config` > built-in
-`opencode/muse-spark-1.3-contributor-free`. If the default is gone, Claude
+`opencode/big-pickle`. If the default is gone, Claude
 picks the best free tool-calling model per the skill's rules and `oc-task`
 refuses any id not in the live catalog.
 

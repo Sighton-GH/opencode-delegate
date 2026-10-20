@@ -40,6 +40,42 @@ done
 catalog=$(mktemp "${TMPDIR:-/tmp}/oc-models.XXXXXX")
 parse_err=$(mktemp "${TMPDIR:-/tmp}/oc-models.XXXXXX")
 trap 'rm -f "$catalog" "$parse_err"' EXIT
+
+# opencode 2.0 dropped `models --verbose` (it prints help and exits 1); the
+# same data — costs, context limits, capabilities — is served by its API.
+# `api --standalone` answers through a throwaway private server, so no
+# background service or password is needed.
+oc_version=$(opencode --version </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+oc_major=${oc_version%%.*}
+[[ -n "$oc_major" && "$oc_major" != *[!0-9]* ]] \
+  || { echo "oc-models: could not parse opencode's version (got: $(opencode --version </dev/null 2>&1 | head -1))" >&2; exit 1; }
+
+if [[ "$oc_major" -ge 2 ]]; then
+  opencode api --standalone model.list </dev/null >"$catalog" 2>/dev/null || true
+  objects=$(jq -c '.data[]' "$catalog" 2>"$parse_err") || {
+    echo "oc-models: opencode's model catalog did not parse ($(head -1 "$parse_err")); run \`opencode models\` to see the plain list" >&2
+    exit 3
+  }
+  [[ -n "$objects" ]] || { echo "oc-models: opencode returned an empty model catalog; is it installed and authenticated?" >&2; exit 3; }
+  # v2 shape: cost is an array of tiers, reasoning lives in capabilities or
+  # compatibility.reasoningField, the release date is epoch milliseconds.
+  jq -r --argjson free_only "$free_only" --argjson verbose "$verbose" '
+        {
+          id:   (.providerID + "/" + (.modelID // .id)),
+          free: ((([.cost[]? | (.input // 0) + (.output // 0)] | add) // 0) == 0),
+          ctx:  (.limit.context // 0),
+          tool: (if (.capabilities.tools // .capabilities.toolcall) then "yes" else "no" end),
+          reason: (if (.capabilities.reasoning // ((.compatibility.reasoningField // null) != null)) then "yes" else "no" end),
+          date: (if (.time.released // 0) > 0 then (.time.released / 1000 | strftime("%Y-%m-%d")) else "" end)
+        }
+        | select($free_only == 0 or .free)
+        | (if .free then "0" else "1" end) + "\t" + .id
+          + (if $verbose == 1 then "\t" + (.ctx|tostring) + "\ttoolcall=" + .tool + "\treasoning=" + .reason + "\t" + .date else "" end)' <<<"$objects" \
+    | sort -t$'\t' -k1,1 -k2,2 \
+    | cut -f2-
+  exit 0
+fi
+
 opencode models --verbose </dev/null >"$catalog" 2>/dev/null || true
 
 # Parse the whole catalog before printing anything. A catalog that does not

@@ -37,6 +37,8 @@ SHIM
   git -C "$FIX_REPO" commit -q -m "seed"
 
   export OC_STUB_STATE="$FIX_STUB_STATE"
+  # v1 behaviour unless a test opts into the v2 surface.
+  export OC_STUB_VERSION=1.18.35
   export XDG_CONFIG_HOME="$FIX_ROOT/config"
   # oc-task reads opencode's data directory (the database-size warning); the
   # user's real one must never leak into a result.

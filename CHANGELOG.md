@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.6.0 — 2026-10-19
+
+opencode 2.0 support. The plugin now detects the installed opencode major
+version and speaks its API on both sides:
+
+- v2's `serve` requires basic auth; oc-task generates a per-run password and
+  passes it to the server (`OPENCODE_SERVER_PASSWORD`), its own curl calls,
+  and the run client (`OPENCODE_PASSWORD`). `--log-level` is lowercased for
+  v2's stricter flag parsing.
+- Session creation uses v2's `POST /api/session` with a `location` object,
+  the `{data:{...}}` response envelope, and v2's `{action,resource,effect}`
+  permission rules. The stash denials now cover v2's renamed `shell` tool and
+  its code-mode `execute` tool. Verified against opencode 2.0.32: the v1 rule
+  shape lets `git stash list` run; the v2 shape refuses it.
+- Runs attach with `opencode run --server` (v2 has no `--attach`/`--dir`; the
+  session's location carries the worktree).
+- `oc-models` reads v2's catalog through `opencode api --standalone
+  model.list`; `models --verbose` no longer exists in v2.
+- v2 error events carry `{type,message}` and its server log puts the
+  provider's words in `cause="..."`; both are parsed now.
+- The built-in default model is `opencode/big-pickle`;
+  `opencode/muse-spark-1.3-contributor-free` left the catalog when 2.0
+  shipped. Free ids rotate; `oc-models --free` always shows the live list.
+- The test suite keeps its v1 coverage and adds a v2 section (stub emulates
+  the v2 server auth, endpoint, and response envelope).
+
 ## 0.5.0 — 2026-10-10
 
 Built from the v0.4.0 field report
