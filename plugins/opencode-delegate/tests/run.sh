@@ -491,7 +491,7 @@ run_oc --brief "$brief" --branch oc/killed --session new --dry-run
 neq "a second run in a live worktree is refused" 0 "$STATUS"
 contains "the refusal says another run is live" "another oc-task run is live" "$OUT"
 OC_STUB_RUN_MODE=nochange run_oc --brief "$brief" --branch oc/beside
-contains "a dispatch beside a live run on the same model warns" "already use opencode/muse-spark-1.3-contributor-free" "$OUT"
+contains "a dispatch beside a live run on the same model warns" "already use opencode/big-pickle" "$OUT"
 kill -TERM "$bg"; wait "$bg" && bg_status=0 || bg_status=$?
 eq "SIGTERM exits 143" 143 "$bg_status"
 contains "the killed run still prints its summary" "killed by SIGTERM" "$(cat "$FIX_ROOT/bg.out")"
@@ -822,5 +822,59 @@ mout=$(cd "$FIX_REPO" && OC_STUB_MODELS_VERBOSE=truncated PATH="$FIX_BIN:$PATH" 
 eq "a catalog that does not parse exits 3, not 5" 3 "$mst"
 contains "and says so" "did not parse" "$mout"
 lacks "and lists nothing from a partial catalog" "muse-spark" "$mout"
+
+section "opencode v2 surface"
+new_fixture v2
+export OC_STUB_VERSION=2.0.32
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+run_oc --brief "$brief" --branch oc/v2
+eq "a v2 dispatch succeeds" 0 "$STATUS"
+contains "the summary names the run" "run:" "$OUT"
+contains "v2 wants a lowercase log level" "--log-level warn" "$(cat "$FIX_STUB_STATE/serve-args")"
+lacks "the v1 spelling is gone" "--log-level WARN" "$(cat "$FIX_STUB_STATE/serve-args")"
+runargs=$(cat "$FIX_STUB_STATE/run-args")
+contains "v2 attaches with --server" "--server" "$runargs"
+lacks "and has no --attach" "--attach" "$runargs"
+lacks "and no --dir (the session carries the worktree)" "--dir" "$runargs"
+body=$(tail -1 "$FIX_STUB_STATE/session-body")
+eq "the v2 blanket allow comes first" "allow" "$(jq -r '.permissions[0].effect' <<<"$body")"
+eq "git stash is denied on the shell tool" "deny" \
+  "$(jq -r '.permissions[] | select(.action == "shell" and .resource == "*git stash*") | .effect' <<<"$body")"
+eq "git -C <dir> stash is denied too" "deny" \
+  "$(jq -r '.permissions[] | select(.action == "shell" and .resource == "*git -C * stash*") | .effect' <<<"$body")"
+eq "and on the code-mode execute tool" "deny" \
+  "$(jq -r '.permissions[] | select(.action == "execute" and .resource == "*git stash*") | .effect' <<<"$body")"
+eq "the worktree rides in the location object" "$FIX_REPO/.oc-worktrees/oc/v2" \
+  "$(jq -r '.location.directory' <<<"$body")"
+auth=$(tail -1 "$FIX_STUB_STATE/session-auth")
+contains "the session request authenticates" "Basic " "$auth"
+
+new_fixture v2refused
+export OC_STUB_VERSION=2.0.32
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_SESSION_STATUS=401 run_oc --brief "$brief" --branch oc/v2refused
+eq "a refused v2 session fails the dispatch" 1 "$STATUS"
+contains "with the session-id explanation" "did not return a session id" "$OUT"
+
+new_fixture v2err
+export OC_STUB_VERSION=2.0.32
+brief="$FIX_ROOT/brief.md"; write_brief "$brief"
+OC_STUB_RUN_MODE=stall OC_DELEGATE_RATE_LIMIT_GRACE=2 \
+  OC_STUB_SERVE_ERROR="Rate limit exceeded. Please try again later." \
+  run_oc --brief "$brief" --branch oc/v2err --idle-timeout 120
+eq "a v2 rate limit in the server log exits 5" 5 "$STATUS"
+contains "the v2 cause= line carries the provider's message" "Rate limit exceeded" "$OUT"
+
+section "oc-models on v2"
+new_fixture v2models
+export OC_STUB_VERSION=2.0.32
+mout=$(cd "$FIX_REPO" && PATH="$FIX_BIN:$PATH" bash "$BIN_DIR/oc-models" --free --verbose 2>&1) && mst=0 || mst=$?
+eq "oc-models --free --verbose exits 0 on v2" 0 "$mst"
+contains "it lists the free model" "opencode/muse-spark-1.3-contributor-free" "$mout"
+lacks "and leaves out the paid one" "paid-model" "$mout"
+mout=$(cd "$FIX_REPO" && OC_STUB_MODELS_VERBOSE=truncated PATH="$FIX_BIN:$PATH" bash "$BIN_DIR/oc-models" --free 2>&1) && mst=0 || mst=$?
+eq "a v2 catalog that does not parse exits 3, not 5" 3 "$mst"
+lacks "and lists nothing from a partial catalog" "muse-spark" "$mout"
+unset OC_STUB_VERSION
 
 summary

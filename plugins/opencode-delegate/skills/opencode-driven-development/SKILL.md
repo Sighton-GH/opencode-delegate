@@ -1,6 +1,6 @@
 ---
 name: opencode-driven-development
-description: Execute implementation work by dispatching opencode sessions (free models, Muse Spark 1.3 by default) as implementers and reviewers, exactly the way subagent-driven-development dispatches subagents. Use for any task worth a plan with 2+ tasks — features, refactors, test suites, multi-file changes — instead of subagent-driven-development or doing the typing yourself. Claude brainstorms, writes the plan and every brief, adjudicates reviews, and merges.
+description: Execute implementation work by dispatching opencode sessions (free models, Big Pickle by default) as implementers and reviewers, exactly the way subagent-driven-development dispatches subagents. Use for any task worth a plan with 2+ tasks — features, refactors, test suites, multi-file changes — instead of subagent-driven-development or doing the typing yourself. Claude brainstorms, writes the plan and every brief, adjudicates reviews, and merges.
 disable-model-invocation: false
 ---
 
@@ -18,7 +18,7 @@ one line.
 
 ## Posture
 
-opencode models are capable engineers, not throwaway ones. Muse Spark 1.3 in
+opencode models are capable engineers, not throwaway ones. Big Pickle in
 particular does excellent work when the brief is detailed, concrete, and
 written in the same register you'd want a brief in: exact paths, exact
 signatures, the code where the plan has it, the test cases, the command to
@@ -108,8 +108,7 @@ oc-undo [--list]
 Free models only. Run `oc-models --free --verbose` once per plan and record
 the choice in the ledger.
 
-- Implementer: `opencode/muse-spark-1.3-contributor-free` when listed;
-  otherwise a newer `muse-spark-*` free variant; otherwise the free model
+- Implementer: `opencode/big-pickle` when listed; otherwise the free model
   with `toolcall=yes` and the largest context, newest release breaking ties.
   Never a model with `toolcall=no`.
 - Task reviewer and re-reviewer: the same model as the implementer is fine.

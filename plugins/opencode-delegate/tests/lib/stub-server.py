@@ -25,6 +25,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
 STATE = os.environ.get("OC_STUB_STATE", ".")
+# With OC_STUB_VERSION set to 2.x, emulate the v2 surface: POST /api/session
+# (basic-auth required, {data:{id}} envelope) and POST /session refused.
+V2 = os.environ.get("OC_STUB_VERSION", "1").split(".")[0] >= "2"
 SESSION_STATUS = int(os.environ.get("OC_STUB_SESSION_STATUS", "200"))
 SERVE_ERROR = os.environ.get("OC_STUB_SERVE_ERROR", "")
 SERVE_ERROR_DELAY = float(os.environ.get("OC_STUB_SERVE_ERROR_DELAY", "1"))
@@ -41,12 +44,19 @@ def record(name, value):
 def log_error_later():
     time.sleep(SERVE_ERROR_DELAY)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
-    sys.stderr.write(
-        'timestamp=%s level=ERROR run=stub message="stream error" providerID=opencode '
-        'modelID=stub session.id=%s small=%s agent=%s mode=primary error.error="%s"\n'
-        % (stamp, SESSION_ID, "true" if SERVE_ERROR_SMALL else "false",
-           "title" if SERVE_ERROR_SMALL else "build", SERVE_ERROR)
-    )
+    if V2:
+        sys.stderr.write(
+            'timestamp=%s level=ERROR run=stub message="Failed to drain Session" '
+            'cause="ProviderError: %s" role=server sessionID=%s\n'
+            % (stamp, SERVE_ERROR, SESSION_ID)
+        )
+    else:
+        sys.stderr.write(
+            'timestamp=%s level=ERROR run=stub message="stream error" providerID=opencode '
+            'modelID=stub session.id=%s small=%s agent=%s mode=primary error.error="%s"\n'
+            % (stamp, SESSION_ID, "true" if SERVE_ERROR_SMALL else "false",
+               "title" if SERVE_ERROR_SMALL else "build", SERVE_ERROR)
+        )
     sys.stderr.flush()
 
 
@@ -70,20 +80,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/session":
-            self._send(404, {})
+        expected = "/api/session" if V2 else "/session"
+        if parsed.path != expected:
+            self._send(405 if V2 else 404, {"error": "wrong surface for this major"})
+            return
+        record("session-auth", self.headers.get("Authorization") or "")
+        if V2 and not (self.headers.get("Authorization") or "").startswith("Basic "):
+            self._send(401, {"error": "unauthorized"})
             return
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length).decode() if length else ""
         record("session-body", body)
-        directory = parse_qs(parsed.query).get("directory", [""])[0]
+        if V2:
+            try:
+                directory = json.loads(body).get("location", {}).get("directory", "")
+            except ValueError:
+                directory = ""
+        else:
+            directory = parse_qs(parsed.query).get("directory", [""])[0]
         record("session-directory", directory)
         if SESSION_STATUS != 200:
             self._send(SESSION_STATUS, {"error": "stub refused"})
             return
         if SERVE_ERROR:
             threading.Thread(target=log_error_later, daemon=True).start()
-        self._send(200, {"id": SESSION_ID})
+        self._send(200, {"data": {"id": SESSION_ID}} if V2 else {"id": SESSION_ID})
 
 
 def main():
